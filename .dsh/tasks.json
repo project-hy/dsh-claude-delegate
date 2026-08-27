@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "nextId": 2,
+  "updatedAt": "2026-08-26T03:24:47.997Z",
+  "tasks": [
+    {
+      "id": "T-1",
+      "title": "验证任务看板端到端可用",
+      "status": "todo",
+      "priority": "P1",
+      "tags": [
+        "verification"
+      ],
+      "assignee": null,
+      "notes": "由 AI 通过 `task_create` 工具创建，用于验证需求 4（AI 可读写任务看板）与工作区共享。",
+      "order": 1000,
+      "createdAt": "2026-08-26T03:24:47.997Z",
+      "updatedAt": "2026-08-26T03:24:47.997Z",
+      "doneAt": null,
+      "createdBy": "ai",
+      "sessionId": "session-4853dafa-faff-4f20-8e86-79efa128892b",
+      "remote": null
+    }
+  ]
+}
