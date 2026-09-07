@@ -2,3 +2,7 @@ node_modules/
 *.log
 .DS_Store
 *.tsbuildinfo
+
+# 嵌套的独立仓库（github.com/zhangjunjesse/ds-spec-loop），自行版本管理，
+# 不作为本仓库内容提交——否则会变成一条无 .gitmodules 的破损 gitlink。
+ds-spec-loop/
