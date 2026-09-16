@@ -75,13 +75,13 @@ export const Config: z<Config> = z.object({
     .description('Derive the delegation default thinking effort from the CALLING session\'s current reasoning-effort tier; an explicit effort argument always wins. Off → always use `effort`.')
     .default(true),
   permissionMode: z.string()
-    .description("Claude Code permission mode: default, acceptEdits, bypassPermissions, plan, dontAsk, or auto.")
+    .description("Claude Code permission mode: default, acceptEdits, bypassPermissions, plan, dontAsk, or auto. Note: delegated sessions are headless — dontAsk silently denies every confirmation prompt; prefer acceptEdits.")
     .default('acceptEdits'),
   maxTurns: z.number().description('Maximum Claude Code agentic turns per task.').default(100),
   timeoutMs: z.number().description('Hard timeout budget for one call (ms); background tasks are aborted once it is reached.').default(7200000),
   warnTimeoutMs: z.number().description('Emit a warning event (do NOT abort) after the task has run this long (ms); 0 disables.').default(3600000),
   warnIntervalMs: z.number().description('Repeat the warning every N ms while the task keeps running past warnTimeoutMs (ms); 0 disables repeats.').default(1800000),
-  cwd: z.string().description('Working directory for Claude Code; defaults to the DSH workspace cwd.'),
+  cwd: z.string().description("Working directory for Claude Code; defaults to the calling session's working directory."),
   allowedTools: z.array(z.string()).description('Claude Code built-in tools to allow.'),
   pathToClaudeCodeExecutable: z.string().description('Path to the claude executable; auto-detected when omitted.'),
   effort: z.string().description('Fallback thinking effort (low/medium/high/xhigh/max), used when no dynamic default applies (see followMainEffort).').default('high'),
@@ -144,6 +144,18 @@ function currentMainSelection(ctx: Context, agent: unknown): MainSelection {
   return { model: a.options?.model }
 }
 
+/**
+ * The CALLING session's working directory (session meta, else creation-time
+ * options). Used as the default delegation cwd — before this, an omitted cwd
+ * fell through to process.cwd(), i.e. the DSH install directory, which is
+ * almost never where the user's files are.
+ */
+function sessionCwd(agent: unknown): string | undefined {
+  const a = agent as { session?: { meta?: { cwd?: string } }; options?: { cwd?: string } } | undefined
+  const cwd = a?.session?.meta?.cwd ?? a?.options?.cwd
+  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+}
+
 const DELEGATION_SKILL: SkillRegistration = {
   name: 'claude-code-delegation',
   description:
@@ -188,7 +200,8 @@ const DELEGATION_SKILL: SkillRegistration = {
     '- 数据是 claude CLI 的缓存，每次委派后会自动刷新；显示 maybeStale 时按"可能偏低"看待。',
     '',
     '## 参数覆盖',
-    '- cwd（工作目录）、model（sonnet/opus/haiku）、permissionMode（default/acceptEdits/bypassPermissions/plan/dontAsk/auto，默认 acceptEdits）、maxTurns、effort（思考强度 low/medium/high/xhigh/max）、resume。',
+    '- cwd（工作目录，不传默认跟随主会话的工作目录）、model（sonnet/opus/haiku）、permissionMode（default/acceptEdits/bypassPermissions/plan/dontAsk/auto，默认 acceptEdits）、maxTurns、effort（思考强度 low/medium/high/xhigh/max）、resume。',
+    '- ⚠️ 委派会话是无头的：dontAsk 会静默拒绝一切需要确认的操作（必挂），除非配了 allowedTools 白名单——后台/常规委派一律用 acceptEdits。',
     '- maxBudgetUsd：本次任务的美元成本上限，超了自动停。',
     '- appendSystemPrompt：追加到 Claude Code 默认系统提示后面的额外指令（约定风格、禁止事项）。',
     '- thinkingMode：adaptive（Claude 自己决定思考量）或 disabled（关闭扩展思考）；maxThinkingTokens 是旧参数，仍可用。',
@@ -942,12 +955,12 @@ export function apply(ctx: Context, config: Config) {
         description: 'Complete, self-contained task description for Claude Code (goal, context, files, constraints).',
         required: true,
       },
-      cwd: { type: 'string', description: 'Working directory for Claude Code; defaults to the configured value or DSH cwd.' },
+      cwd: { type: 'string', description: "Working directory for Claude Code; defaults to the calling session's working directory (configured cwd takes precedence)." },
       model: { type: 'string', description: 'Override the Claude model alias/id for this call. Default follows the current main model (fable→opus, opus→sonnet, sonnet→sonnet), else the configured fallback.' },
       permissionMode: {
         type: 'string',
         enum: [...PERMISSION_MODES],
-        description: "Override Claude Code permission mode for this call (acceptEdits is the default; auto lets a classifier approve or deny prompts).",
+        description: "Override Claude Code permission mode for this call (acceptEdits is the default; auto lets a classifier approve or deny prompts). WARNING: delegated sessions are headless, so dontAsk silently DENIES every confirmation prompt — the task will fail unless paired with an allowedTools whitelist; prefer acceptEdits.",
       },
       maxTurns: { type: 'integer', description: 'Override the maximum number of Claude Code agentic turns for this call.' },
       allowedTools: {
@@ -1049,7 +1062,7 @@ export function apply(ctx: Context, config: Config) {
       const main = currentMainSelection(ctx, exec.agent)
       const req: RunRequest = {
         task: args.task,
-        cwd: args.cwd ?? config.cwd ?? process.cwd(),
+        cwd: args.cwd ?? config.cwd ?? sessionCwd(exec.agent) ?? process.cwd(),
         // Explicit argument > follow-main-session default > configured fallback.
         model: args.model
           ?? (config.followMainModel !== false ? delegateModelFor(main.model) : undefined)

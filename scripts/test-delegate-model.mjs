@@ -37,6 +37,10 @@ assert.match(built, /args\.model\s*\?\?\s*\(config\.followMainModel !== false \?
 assert.match(built, /args\.effort\s*\?\?\s*\(config\.followMainEffort !== false \? delegateEffortFor\(main\.reasoningEffort\) : undefined\)\s*\?\?\s*config\.effort/,
   'effort precedence must be: explicit arg > follow-main-effort > config fallback')
 assert.match(built, /followMainEffort: z\.boolean\(\)/, 'followMainEffort must be a configurable switch')
+assert.match(built, /args\.cwd\s*\?\?\s*config\.cwd\s*\?\?\s*sessionCwd\(exec\.agent\)\s*\?\?\s*process\.cwd\(\)/,
+  'cwd precedence must be: explicit arg > configured cwd > calling session cwd > process.cwd()')
+assert.match(built, /session\?\.meta\?\.cwd \?\? a\?\.options\?\.cwd/,
+  'session cwd must come from session meta with creation-time options as fallback')
 assert.match(built, /stateOf\(a\.session, ['"]modelSelection['"]\)/,
   'main model must come from the live modelSelection projection (mid-session switches)')
 assert.match(built, /state\?\.pending \?\? state\?\.lastUsed/,

@@ -8,6 +8,11 @@
 - 版本史：0.1.2 → **0.2.0**（后台任务/流式输出/错误诊断/SDK 新能力/proxy 配置）→ **0.3.0**（Claude Code 监控面板 tab + 额度工具），均已实现并部署到 desktop profile
 
 ## 已完成
+- [x] **0.6.0 已实现并部署到 web+desktop**（2026-09-16）：① 委派 cwd 默认跟随
+  主会话工作目录（显式参数 > 配置 > 会话 cwd > process.cwd()；此前不传会落在
+  DSH 安装目录）；② dontAsk 陷阱在工具 schema/配置描述/委派技能三处写明
+  （无头会话下静默拒绝一切确认，除非配 allowedTools 白名单；推荐 acceptEdits）,
+  未硬禁。测试钉住 cwd 优先级链与 sessionCwd 读取路径。
 - [x] **0.5.0 已实现并部署到 web+desktop**（2026-09-16）：委派默认思考强度跟随
   主会话档位（`followMainEffort`，默认开）。优先级：显式 effort 参数 > 会话档位 >
   config.effort（high）。档位来自同一个 modelSelection 投影的 `reasoningEffort`

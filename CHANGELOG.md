@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0
+- **Delegation cwd defaults to the calling session's working directory.** An omitted `cwd` used to fall through to `process.cwd()` — the DSH install directory, which is almost never where the user's files are. New precedence: explicit `cwd` argument > configured `cwd` > calling session's cwd (`agent.session.meta.cwd ?? agent.options.cwd`, same resolution dsh-claude-driver uses) > `process.cwd()` as the last resort.
+- **dontAsk trap documented at every surface the model reads.** Delegated sessions are headless, so `permissionMode: 'dontAsk'` silently denies every confirmation prompt and the task predictably fails unless paired with an `allowedTools` whitelist. Not hard-blocked (whitelist + deny-the-rest is a legitimate strict-sandbox pattern), but the tool schema, the config description and the delegation skill now all warn and steer to `acceptEdits`.
+
 ## 0.5.0
 - **Follow-main-effort delegation default** (`followMainEffort`, default on). When the `effort` argument is omitted, the delegate thinking effort now follows the calling session's current reasoning-effort tier (read from the same `modelSelection` projection as the model — it carries `reasoningEffort` alongside `model`), instead of always `high`. Precedence: explicit `effort` argument > session tier > `effort` config fallback (`high`). Only tiers Claude Code accepts (`low/medium/high/xhigh/max`, case-insensitive) pass through; a foreign tier name from a non-Claude provider falls back to config. `EFFORT_LEVELS` moved into the dependency-free `delegate-model.ts` as the single source of truth for both the schema enum and the follow filter; `currentMainModel()` generalized to `currentMainSelection()` returning `{ model, reasoningEffort }` in one projection read.
 
