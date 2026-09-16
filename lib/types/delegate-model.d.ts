@@ -11,3 +11,13 @@
  * can import it without dragging in the host service graph.
  */
 export declare function delegateModelFor(mainModel: string | undefined): string | undefined;
+/** Claude Code CLI effort tiers, single source of truth for schema + follow. */
+export declare const EFFORT_LEVELS: readonly ["low", "medium", "high", "xhigh", "max"];
+/**
+ * Default delegate effort derived from the caller's current reasoning effort
+ * (user policy 2026-09-16: delegation follows the main session's effort tier).
+ * Only passes through values Claude Code actually accepts — a DSH session on
+ * a provider with a foreign tier name falls back to config.effort. Explicit
+ * `effort` argument always wins upstream.
+ */
+export declare function delegateEffortFor(mainEffort: string | undefined): string | undefined;

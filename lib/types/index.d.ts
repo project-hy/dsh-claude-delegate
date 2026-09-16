@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import { delegateModelFor } from './delegate-model.js';
-export { delegateModelFor };
+import { delegateModelFor, delegateEffortFor } from './delegate-model.js';
+export { delegateModelFor, delegateEffortFor };
 export declare const name = "claude-code";
 export declare const inject: string[];
 export interface SubagentConfig {
@@ -17,6 +17,7 @@ export interface SubagentConfig {
 export interface Config {
     model: string;
     followMainModel: boolean;
+    followMainEffort: boolean;
     permissionMode: string;
     maxTurns: number;
     timeoutMs: number;

@@ -18,3 +18,19 @@ export function delegateModelFor(mainModel: string | undefined): string | undefi
   if (m.includes('sonnet')) return 'sonnet'
   return undefined
 }
+
+/** Claude Code CLI effort tiers, single source of truth for schema + follow. */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/**
+ * Default delegate effort derived from the caller's current reasoning effort
+ * (user policy 2026-09-16: delegation follows the main session's effort tier).
+ * Only passes through values Claude Code actually accepts — a DSH session on
+ * a provider with a foreign tier name falls back to config.effort. Explicit
+ * `effort` argument always wins upstream.
+ */
+export function delegateEffortFor(mainEffort: string | undefined): string | undefined {
+  if (!mainEffort) return undefined
+  const e = mainEffort.toLowerCase()
+  return (EFFORT_LEVELS as readonly string[]).includes(e) ? e : undefined
+}

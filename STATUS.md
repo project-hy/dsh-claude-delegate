@@ -8,6 +8,12 @@
 - 版本史：0.1.2 → **0.2.0**（后台任务/流式输出/错误诊断/SDK 新能力/proxy 配置）→ **0.3.0**（Claude Code 监控面板 tab + 额度工具），均已实现并部署到 desktop profile
 
 ## 已完成
+- [x] **0.5.0 已实现并部署到 web+desktop**（2026-09-16）：委派默认思考强度跟随
+  主会话档位（`followMainEffort`，默认开）。优先级：显式 effort 参数 > 会话档位 >
+  config.effort（high）。档位来自同一个 modelSelection 投影的 `reasoningEffort`
+  字段（`currentMainModel` 泛化为 `currentMainSelection`，一次读取拿 model+effort）；
+  只放行 low/medium/high/xhigh/max（大小写不敏感），外来档位名回退 config。
+  EFFORT_LEVELS 移入 delegate-model.ts 作为唯一事实源。测试补 8 组断言。
 - [x] **0.4.1 已实现并部署到 web+desktop**（2026-09-16）：修复 0.4.0 的启动死锁。
   本机 cordis 4.x **没有 optional inject**——`{required, optional}` 对象形式被当成
   两个字面服务名，fiber 永远 `waiting for services: required, optional`，插件树

@@ -3,7 +3,7 @@
 // Run: node scripts/test-delegate-model.mjs
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { delegateModelFor } from '../lib/delegate-model.js'
+import { delegateModelFor, delegateEffortFor, EFFORT_LEVELS } from '../lib/delegate-model.js'
 
 // --- the mapping itself --------------------------------------------------------
 assert.equal(delegateModelFor('fable'), 'opus', 'fable main delegates opus')
@@ -21,10 +21,22 @@ assert.equal(delegateModelFor('haiku'), undefined, 'haiku unspecified by the pol
 assert.equal(delegateModelFor(undefined), undefined)
 assert.equal(delegateModelFor(''), undefined)
 
+// --- follow-main-effort (user-decided policy 2026-09-16) -----------------------
+assert.deepEqual([...EFFORT_LEVELS], ['low', 'medium', 'high', 'xhigh', 'max'],
+  'effort tiers are the Claude Code CLI set, single source of truth')
+for (const tier of EFFORT_LEVELS) assert.equal(delegateEffortFor(tier), tier, `${tier} passes through`)
+assert.equal(delegateEffortFor('MAX'), 'max', 'case-insensitive')
+assert.equal(delegateEffortFor('ultra'), undefined, 'foreign tier name → configured fallback')
+assert.equal(delegateEffortFor(undefined), undefined, 'no session effort → configured fallback')
+assert.equal(delegateEffortFor(''), undefined)
+
 // --- wiring: precedence and projection read live in the built artifact ---------
 const built = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
-assert.match(built, /args\.model\s*\?\?\s*\(config\.followMainModel !== false \? delegateModelFor\(currentMainModel\(ctx, exec\.agent\)\) : undefined\)\s*\?\?\s*config\.model/,
-  'precedence must be: explicit arg > follow-main-model > config fallback')
+assert.match(built, /args\.model\s*\?\?\s*\(config\.followMainModel !== false \? delegateModelFor\(main\.model\) : undefined\)\s*\?\?\s*config\.model/,
+  'model precedence must be: explicit arg > follow-main-model > config fallback')
+assert.match(built, /args\.effort\s*\?\?\s*\(config\.followMainEffort !== false \? delegateEffortFor\(main\.reasoningEffort\) : undefined\)\s*\?\?\s*config\.effort/,
+  'effort precedence must be: explicit arg > follow-main-effort > config fallback')
+assert.match(built, /followMainEffort: z\.boolean\(\)/, 'followMainEffort must be a configurable switch')
 assert.match(built, /stateOf\(a\.session, ['"]modelSelection['"]\)/,
   'main model must come from the live modelSelection projection (mid-session switches)')
 assert.match(built, /state\?\.pending \?\? state\?\.lastUsed/,

@@ -9,9 +9,9 @@ import { spawnSync } from 'node:child_process'
 import { JobTracker, createEventBuffer, type ClaudeEvent, type EventBuffer, type TrackedSettlement } from './tracker.js'
 import { ClaudeCodeRemote } from './remote.js'
 import { DEFAULT_STALE_AFTER_MINUTES, readUsageSnapshot, renderUsage } from './usage.js'
-import { delegateModelFor } from './delegate-model.js'
+import { delegateModelFor, delegateEffortFor, EFFORT_LEVELS } from './delegate-model.js'
 
-export { delegateModelFor }
+export { delegateModelFor, delegateEffortFor }
 
 export const name = 'claude-code'
 // NOTE: this cordis (@deepseek-ai/cordis 4.x) has NO optional-inject concept —
@@ -31,7 +31,6 @@ const MAX_LIVE_BUFFER = 500_000
 const MAX_EVENT_TEXT = 2000
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'] as const
-const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 const THINKING_MODES = ['adaptive', 'disabled'] as const
 
 export interface SubagentConfig {
@@ -48,6 +47,7 @@ export interface SubagentConfig {
 export interface Config {
   model: string
   followMainModel: boolean
+  followMainEffort: boolean
   permissionMode: string
   maxTurns: number
   timeoutMs: number
@@ -71,6 +71,9 @@ export const Config: z<Config> = z.object({
   followMainModel: z.boolean()
     .description('Derive the delegation default from the CALLING session\'s current main model (fable→opus, opus→sonnet, sonnet→sonnet); an explicit model argument always wins. Off → always use `model`.')
     .default(true),
+  followMainEffort: z.boolean()
+    .description('Derive the delegation default thinking effort from the CALLING session\'s current reasoning-effort tier; an explicit effort argument always wins. Off → always use `effort`.')
+    .default(true),
   permissionMode: z.string()
     .description("Claude Code permission mode: default, acceptEdits, bypassPermissions, plan, dontAsk, or auto.")
     .default('acceptEdits'),
@@ -81,7 +84,7 @@ export const Config: z<Config> = z.object({
   cwd: z.string().description('Working directory for Claude Code; defaults to the DSH workspace cwd.'),
   allowedTools: z.array(z.string()).description('Claude Code built-in tools to allow.'),
   pathToClaudeCodeExecutable: z.string().description('Path to the claude executable; auto-detected when omitted.'),
-  effort: z.string().description('Thinking effort: low, medium, high, xhigh, or max.').default('high'),
+  effort: z.string().description('Fallback thinking effort (low/medium/high/xhigh/max), used when no dynamic default applies (see followMainEffort).').default('high'),
   maxThinkingTokens: z.number().description('Optional thinking token budget per task (deprecated; prefer thinkingMode).'),
   thinkingMode: z.union([...THINKING_MODES])
     .description('Thinking mode: adaptive (Claude decides) or disabled. Unset keeps the SDK default.'),
@@ -107,16 +110,20 @@ export const Config: z<Config> = z.object({
   })).description('Custom subagents exposed to Claude Code via its Agent tool, keyed by subagent name.'),
 })
 
+/** The CALLING session's current selection (model + reasoning-effort tier). */
+interface MainSelection { model?: string; reasoningEffort?: string }
+
 /**
- * The CALLING session's current main model. Authoritative source is the
- * durable `modelSelection` session projection (pending ?? lastUsed), which
- * tracks mid-session model switches; `agent.options.model` is only the
- * creation-time value and is used as the fallback when the projection
- * service or state is unavailable.
+ * The CALLING session's current main-model selection. Authoritative source is
+ * the durable `modelSelection` session projection (pending ?? lastUsed), which
+ * tracks mid-session model/effort switches and carries `reasoningEffort`
+ * alongside `model`; `agent.options.model` is only the creation-time value and
+ * is used as the fallback when the projection service or state is unavailable
+ * (creation-time options carry no effort, so effort is simply absent there).
  */
-function currentMainModel(ctx: Context, agent: unknown): string | undefined {
+function currentMainSelection(ctx: Context, agent: unknown): MainSelection {
   const a = agent as { session?: unknown; options?: { model?: string } } | undefined
-  if (a === undefined) return undefined
+  if (a === undefined) return {}
   try {
     // ctx.get() reads a service WITHOUT the inject requirement (cordis
     // reflect.get mixin) — returns undefined when the service is absent,
@@ -124,17 +131,17 @@ function currentMainModel(ctx: Context, agent: unknown): string | undefined {
     const projections = (ctx as unknown as { get?: (name: string) => unknown })
       .get?.('sessionProjections') as {
         stateOf?: (session: unknown, key: string) =>
-          { pending?: { model?: string } | null; lastUsed?: { model?: string } | null } | undefined
+          { pending?: MainSelection | null; lastUsed?: MainSelection | null } | undefined
       } | undefined
     if (a.session !== undefined && typeof projections?.stateOf === 'function') {
       const state = projections.stateOf(a.session, 'modelSelection')
       const selected = state?.pending ?? state?.lastUsed
-      if (selected?.model) return selected.model
+      if (selected?.model) return selected
     }
   } catch {
     // projection not registered in this profile — creation-time fallback below
   }
-  return a.options?.model
+  return { model: a.options?.model }
 }
 
 const DELEGATION_SKILL: SkillRegistration = {
@@ -955,7 +962,7 @@ export function apply(ctx: Context, config: Config) {
       effort: {
         type: 'string',
         enum: [...EFFORT_LEVELS],
-        description: "Override Claude Code thinking effort for this call (high is the default).",
+        description: "Override Claude Code thinking effort for this call (default follows the calling session's effort tier, else 'high').",
       },
       maxThinkingTokens: {
         type: 'integer',
@@ -1039,12 +1046,13 @@ export function apply(ctx: Context, config: Config) {
     },
     timeoutMs: config.timeoutMs,
     async execute(args: any, exec) {
+      const main = currentMainSelection(ctx, exec.agent)
       const req: RunRequest = {
         task: args.task,
         cwd: args.cwd ?? config.cwd ?? process.cwd(),
-        // Explicit argument > follow-main-model mapping > configured fallback.
+        // Explicit argument > follow-main-session default > configured fallback.
         model: args.model
-          ?? (config.followMainModel !== false ? delegateModelFor(currentMainModel(ctx, exec.agent)) : undefined)
+          ?? (config.followMainModel !== false ? delegateModelFor(main.model) : undefined)
           ?? config.model,
         permissionMode: args.permissionMode ?? config.permissionMode,
         maxTurns: args.maxTurns ?? config.maxTurns,
@@ -1054,7 +1062,9 @@ export function apply(ctx: Context, config: Config) {
         allowedTools: args.allowedTools ?? config.allowedTools,
         pathToClaudeCodeExecutable: config.pathToClaudeCodeExecutable,
         resume: args.resume,
-        effort: args.effort ?? config.effort,
+        effort: args.effort
+          ?? (config.followMainEffort !== false ? delegateEffortFor(main.reasoningEffort) : undefined)
+          ?? config.effort,
         maxThinkingTokens: args.maxThinkingTokens ?? config.maxThinkingTokens,
         thinkingMode: args.thinkingMode ?? config.thinkingMode,
         maxBudgetUsd: args.maxBudgetUsd ?? config.maxBudgetUsd,
