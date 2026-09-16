@@ -8,6 +8,20 @@
 - 版本史：0.1.2 → **0.2.0**（后台任务/流式输出/错误诊断/SDK 新能力/proxy 配置）→ **0.3.0**（Claude Code 监控面板 tab + 额度工具），均已实现并部署到 desktop profile
 
 ## 已完成
+- [x] **0.4.1 已实现并部署到 web+desktop**（2026-09-16）：修复 0.4.0 的启动死锁。
+  本机 cordis 4.x **没有 optional inject**——`{required, optional}` 对象形式被当成
+  两个字面服务名，fiber 永远 `waiting for services: required, optional`，插件树
+  加载失败（用户被迫卸载）。修法：`inject` 回到 `['tools','skills']` 数组，
+  `sessionProjections` 改为运行时 `ctx.get()` 懒读（绕过 inject 要求，缺席返回
+  undefined）。0.4.0 的跟随主模型行为不变。测试钉住回归。教训：**给 inject 加
+  任何服务名前，先确认该 profile 一定提供它——这版 cordis 缺一个就整树不激活。**
+  dsh-doctor 零告警，web dump-config 组合正常。未 git commit（待用户确认）。
+- [x] **0.4.0 已实现并部署到 web+desktop**（2026-09-16）：委派默认模型跟随主模型
+  （fable→opus、opus→sonnet、sonnet→sonnet，用户拍板；显式 model 参数 > 映射 >
+  config.model 兜底）。主模型读 `modelSelection` 会话投影（pending ?? lastUsed，
+  中途切模型也准），`sessionProjections` 以 optional inject 接入。新增
+  `src/delegate-model.ts`（无依赖，供离线测试）+ `scripts/test-delegate-model.mjs`
+  （通过）。build 全绿，dsh-doctor 零告警。未 git commit（待用户确认）。
 - [x] **0.3.0 已实现并部署**（git 16682ed，version 0.3.0）：
   - P0：done.detail 富化 `$0.13 · 12 turns · 3m20s`（官方任务列表直接显示）
   - P1：Claude Code 监控面板 —— 会话头第三个 tab（conversation.view, id 'claude-code', order 100）

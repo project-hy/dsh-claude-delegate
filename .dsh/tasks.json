@@ -1,24 +1,38 @@
 {
   "version": 1,
-  "nextId": 2,
-  "updatedAt": "2026-08-26T03:24:47.997Z",
+  "nextId": 4,
+  "updatedAt": "2026-09-11T00:55:38.672Z",
   "tasks": [
     {
-      "id": "T-1",
-      "title": "验证任务看板端到端可用",
+      "id": "T-2",
+      "title": "希望用户可以通过agent设置自己的定时任务；比如每日信息推送，每日总结等；任务这块需要做区分。有些是用户自己的任务，有些是公共全局任务，用户可以订阅；",
       "status": "todo",
-      "priority": "P1",
-      "tags": [
-        "verification"
-      ],
+      "priority": "P2",
+      "tags": [],
       "assignee": null,
-      "notes": "由 AI 通过 `task_create` 工具创建，用于验证需求 4（AI 可读写任务看板）与工作区共享。",
-      "order": 1000,
-      "createdAt": "2026-08-26T03:24:47.997Z",
-      "updatedAt": "2026-08-26T03:24:47.997Z",
+      "notes": "",
+      "order": 2000,
+      "createdAt": "2026-09-10T08:07:17.041Z",
+      "updatedAt": "2026-09-10T08:07:17.041Z",
       "doneAt": null,
-      "createdBy": "ai",
-      "sessionId": "session-4853dafa-faff-4f20-8e86-79efa128892b",
+      "createdBy": "user",
+      "sessionId": "session-edc4290c-4da9-4205-849c-c18d4fd3df3e",
+      "remote": null
+    },
+    {
+      "id": "T-3",
+      "title": "让任意的AI都能跟自己的助手AI通信",
+      "status": "todo",
+      "priority": "P2",
+      "tags": [],
+      "assignee": null,
+      "notes": "",
+      "order": 3000,
+      "createdAt": "2026-09-11T00:55:38.672Z",
+      "updatedAt": "2026-09-11T00:55:38.672Z",
+      "doneAt": null,
+      "createdBy": "user",
+      "sessionId": "session-edc4290c-4da9-4205-849c-c18d4fd3df3e",
       "remote": null
     }
   ]

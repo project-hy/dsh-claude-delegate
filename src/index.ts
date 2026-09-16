@@ -9,11 +9,20 @@ import { spawnSync } from 'node:child_process'
 import { JobTracker, createEventBuffer, type ClaudeEvent, type EventBuffer, type TrackedSettlement } from './tracker.js'
 import { ClaudeCodeRemote } from './remote.js'
 import { DEFAULT_STALE_AFTER_MINUTES, readUsageSnapshot, renderUsage } from './usage.js'
+import { delegateModelFor } from './delegate-model.js'
+
+export { delegateModelFor }
 
 export const name = 'claude-code'
+// NOTE: this cordis (@deepseek-ai/cordis 4.x) has NO optional-inject concept —
+// every name declared in `inject` blocks activation until the service exists
+// (the `{required, optional}` object form is treated as literal service names
+// "required"/"optional" and deadlocks the fiber; see CHANGELOG 0.4.1).
+// sessionProjections is therefore read lazily via `ctx.get()` at call time,
+// which bypasses the inject requirement and returns undefined when absent.
 export const inject = ['tools', 'skills']
 
-const CLIENT_APP = 'dsh-claude-code/0.3.5'
+const CLIENT_APP = 'dsh-claude-code/0.4.1'
 
 /** Cap for the live-output buffers kept per background job. */
 const MAX_LIVE_BUFFER = 500_000
@@ -38,6 +47,7 @@ export interface SubagentConfig {
 
 export interface Config {
   model: string
+  followMainModel: boolean
   permissionMode: string
   maxTurns: number
   timeoutMs: number
@@ -57,7 +67,10 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
-  model: z.string().description('Claude model alias (sonnet/opus/haiku) or full id.').default('sonnet'),
+  model: z.string().description('Fallback Claude model alias (sonnet/opus/haiku) or full id, used when no dynamic default applies.').default('sonnet'),
+  followMainModel: z.boolean()
+    .description('Derive the delegation default from the CALLING session\'s current main model (fable→opus, opus→sonnet, sonnet→sonnet); an explicit model argument always wins. Off → always use `model`.')
+    .default(true),
   permissionMode: z.string()
     .description("Claude Code permission mode: default, acceptEdits, bypassPermissions, plan, dontAsk, or auto.")
     .default('acceptEdits'),
@@ -93,6 +106,36 @@ export const Config: z<Config> = z.object({
     background: z.boolean().description('Run this subagent as a background task when invoked.'),
   })).description('Custom subagents exposed to Claude Code via its Agent tool, keyed by subagent name.'),
 })
+
+/**
+ * The CALLING session's current main model. Authoritative source is the
+ * durable `modelSelection` session projection (pending ?? lastUsed), which
+ * tracks mid-session model switches; `agent.options.model` is only the
+ * creation-time value and is used as the fallback when the projection
+ * service or state is unavailable.
+ */
+function currentMainModel(ctx: Context, agent: unknown): string | undefined {
+  const a = agent as { session?: unknown; options?: { model?: string } } | undefined
+  if (a === undefined) return undefined
+  try {
+    // ctx.get() reads a service WITHOUT the inject requirement (cordis
+    // reflect.get mixin) — returns undefined when the service is absent,
+    // instead of blocking plugin activation like an inject declaration would.
+    const projections = (ctx as unknown as { get?: (name: string) => unknown })
+      .get?.('sessionProjections') as {
+        stateOf?: (session: unknown, key: string) =>
+          { pending?: { model?: string } | null; lastUsed?: { model?: string } | null } | undefined
+      } | undefined
+    if (a.session !== undefined && typeof projections?.stateOf === 'function') {
+      const state = projections.stateOf(a.session, 'modelSelection')
+      const selected = state?.pending ?? state?.lastUsed
+      if (selected?.model) return selected.model
+    }
+  } catch {
+    // projection not registered in this profile — creation-time fallback below
+  }
+  return a.options?.model
+}
 
 const DELEGATION_SKILL: SkillRegistration = {
   name: 'claude-code-delegation',
@@ -893,7 +936,7 @@ export function apply(ctx: Context, config: Config) {
         required: true,
       },
       cwd: { type: 'string', description: 'Working directory for Claude Code; defaults to the configured value or DSH cwd.' },
-      model: { type: 'string', description: 'Override the Claude model alias/id for this call.' },
+      model: { type: 'string', description: 'Override the Claude model alias/id for this call. Default follows the current main model (fable→opus, opus→sonnet, sonnet→sonnet), else the configured fallback.' },
       permissionMode: {
         type: 'string',
         enum: [...PERMISSION_MODES],
@@ -999,7 +1042,10 @@ export function apply(ctx: Context, config: Config) {
       const req: RunRequest = {
         task: args.task,
         cwd: args.cwd ?? config.cwd ?? process.cwd(),
-        model: args.model ?? config.model,
+        // Explicit argument > follow-main-model mapping > configured fallback.
+        model: args.model
+          ?? (config.followMainModel !== false ? delegateModelFor(currentMainModel(ctx, exec.agent)) : undefined)
+          ?? config.model,
         permissionMode: args.permissionMode ?? config.permissionMode,
         maxTurns: args.maxTurns ?? config.maxTurns,
         timeoutMs: args.timeoutMs ?? config.timeoutMs,
