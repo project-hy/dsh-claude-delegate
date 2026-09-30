@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-code",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "DSH tool plugin: delegate a self-contained task to your local Claude Code subscription (via the official Claude Agent SDK).",
   "type": "module",
   "main": "lib/index.js",
@@ -41,7 +41,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhangjunjesse/dsh-claude-code.git"
+    "url": "git+https://github.com/project-hy/dsh-claude-code.git"
   },
   "keywords": [
     "dsh",
@@ -63,10 +63,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-skill": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-skill": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-rc.6 <0.3.0",
     "@deepseek-ai/schemastery": "^3.18.1",
     "react": "^18.2.0"
   },
@@ -81,17 +81,17 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/cosmokit": "^1.8.2",
-    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-attachment": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-brand": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-invariants": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-scope": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-skill": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-attachment": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.0.0",
     "@types/react": "~18.3.1",

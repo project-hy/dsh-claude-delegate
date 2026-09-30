@@ -1,16 +1,17 @@
-# Bundle wiring for dsh plugin add / registry installs.
-# NOTE: proxy below is a machine-specific default for this dev machine (outbound is a datacenter IP,
-# Anthropic rejects direct requests with 403). Publishing later should drop or comment the proxy line.
+# Bundle wiring for `dsh plugin add` / registry installs.
+# Ships safe, machine-independent defaults:
+#   * no `proxy` — add one only when this machine's outbound IP is a datacenter IP and
+#     Anthropic answers 403 (e.g. `proxy: http://127.0.0.1:7890`). A `proxy` pointing at a
+#     port with no service makes every delegation fail with ECONNREFUSED
+#     ("API Error: Connection refused").
+#   * no `permissionMode: bypassPermissions` — delegated sessions are headless, so bypass
+#     means a Claude with no permission checks at all. `acceptEdits` is the recommended mode.
 # timeoutMs = hard abort (2h); warnTimeoutMs/warnIntervalMs = periodic warnings in the panel (defaults 1h/30m).
-# permissionMode bypassPermissions + allowDangerouslySkipPermissions = run everything without prompts
-# (trusted machine; publishing later should revert to acceptEdits).
 - insert:
     - id: claude-code
       name: dsh-claude-code
       config:
         model: sonnet
-        permissionMode: bypassPermissions
-        allowDangerouslySkipPermissions: true
+        permissionMode: acceptEdits
         maxTurns: 100
         timeoutMs: 7200000
-        proxy: http://127.0.0.1:7897

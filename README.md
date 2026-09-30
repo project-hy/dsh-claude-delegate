@@ -27,7 +27,11 @@ npm install dsh-claude-code
 #       name: 'dsh-claude-code'
 ```
 
-装完重启 dsh。插件自带 `cordis.patch.yml`（`dsh.bundle` manifest），`dsh plugin add` 会用它自动接线。
+装完重启 dsh。插件自带 `cordis.patch.yml`（`dsh.bundle` manifest），`dsh plugin add` 会用它自动接线。自带接线是**安全默认**（`acceptEdits`，不带代理）；只有本机出网 IP 是数据中心 IP、Anthropic 返回 403 时才需要自己加 `proxy`。
+
+> 支持的 DSH 线：**0.1.0-rc.6 – 0.2.0-rc.2**（peer 范围 `>=0.1.0-rc.6 <0.3.0`）。已在 `@deepseek-ai/dsh-*@0.2.0-rc.2` 真实类型线上 `npm run typecheck` 零错误、`npm run build` 通过。
+>
+> 从源码开发：`npm install --legacy-peer-deps`（直接 `npm install` 会因 `dsh-system-prompt` → `dsh-invariants` 的 peer 冲突 ERESOLVE 失败）。
 
 接线示例（带配置）：
 
@@ -46,7 +50,7 @@ npm install dsh-claude-code
         # maxBudgetUsd: 2
         # appendSystemPrompt: 始终用中文写提交信息；不要碰 lib/ 目录。
         # 可选：出网 IP 是数据中心 IP 时走本机代理（Anthropic 403 的解法）
-        # proxy: http://127.0.0.1:7897
+        # proxy: http://127.0.0.1:<你的代理端口>
         # 可选：自定义 subagents（Claude Code 内可被 Agent 工具调用）
         # subagents:
         #   reviewer:
@@ -63,7 +67,9 @@ npm install dsh-claude-code
 | `model` | `sonnet` | Claude 模型别名或完整 id |
 | `permissionMode` | `acceptEdits` | Claude Code 权限模式。`acceptEdits` 自动放行文件编辑；`auto` 由分类器自动批/拒；`bypassPermissions` 完全免确认（需信任，且要开下面的开关） |
 | `maxTurns` | `100` | 每次任务 Claude Code 最多跑多少轮 |
-| `timeoutMs` | `600000` | 单次调用的协作超时（后台任务同样受它约束） |
+| `timeoutMs` | `7200000` | 单次调用的硬超时，到点强制中止（后台任务同样受它约束） |
+| `warnTimeoutMs` | `3600000` | 跑满这么久后发一条 `warning` 事件（不中止）；`0` 关闭 |
+| `warnIntervalMs` | `1800000` | 超过 `warnTimeoutMs` 后每隔这么久重复告警；`0` 关闭重复 |
 | `cwd` | DSH cwd | Claude Code 工作目录 |
 | `allowedTools` | 未设 | 允许的 Claude Code 内置工具名列表 |
 | `pathToClaudeCodeExecutable` | 自动 | `claude` 可执行文件路径 |
@@ -73,7 +79,7 @@ npm install dsh-claude-code
 | `maxBudgetUsd` | 未设 | 单次任务的美元成本上限，达到即停 |
 | `appendSystemPrompt` | 未设 | 追加到 Claude Code 默认系统提示后面的额外指令 |
 | `allowDangerouslySkipPermissions` | `false` | 有意的安全开关；不开时 `permissionMode: bypassPermissions` 会被直接拒绝 |
-| `proxy` | 未设 | 给 claude 子进程设置的 HTTP 代理（如 `http://127.0.0.1:7897`），写入其 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`；出网 IP 是数据中心 IP、Anthropic 返回 403 时用它 |
+| `proxy` | 未设 | 给 claude 子进程设置的 HTTP 代理（如 `http://127.0.0.1:7890`），写入其 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`；出网 IP 是数据中心 IP、Anthropic 返回 403 时用它 |
 | `subagents` | 未设 | 自定义 subagent 表：名称 → `{ description, prompt, tools?, disallowedTools?, model?, maxTurns?, initialPrompt?, background? }`，注册到 Claude Code 的 Agent 工具 |
 
 ## 工具一览（模型可见）

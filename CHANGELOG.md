@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+- **Runs on the DSH 0.2 line (`0.1.0-rc.6` – `0.2.0-rc.2`).** Peer ranges are now `>=0.1.0-rc.6 <0.3.0`; dsh 0.2 refuses to load a plugin whose dsh peer range leaves out the running version, so every 0.6.0 install on DSH 0.2 failed at load time. The source typechecks (`tsc --noEmit` on both halves) and builds against the real `@deepseek-ai/dsh-*@0.2.0-rc.2` type packages with zero errors; the emitted host JS is byte-identical to 0.6.0's.
+- **The bundled `cordis.patch.yml` now ships safe, machine-independent defaults.** It no longer carries the author's dev-machine `proxy: http://127.0.0.1:7897` (a proxy pointing at a port with no service makes every delegation fail with `ECONNREFUSED` / `API Error: Connection refused`) nor `permissionMode: bypassPermissions` + `allowDangerouslySkipPermissions: true` (a delegated Claude with no permission checks at all). It ships `permissionMode: acceptEdits`; add `proxy` only when this machine's outbound IP is a datacenter IP and Anthropic answers 403.
+- **Dev note:** install dependencies with `npm install --legacy-peer-deps` — the pinned `@deepseek-ai/dsh-*@0.2.0-rc.2` set trips npm's strict peer resolver through `dsh-system-prompt` → `dsh-invariants`.
+- Repository moved to `https://github.com/project-hy/dsh-claude-code`; the SDK client identifier now reports the real plugin version.
+
 ## 0.6.0
 - **Delegation cwd defaults to the calling session's working directory.** An omitted `cwd` used to fall through to `process.cwd()` — the DSH install directory, which is almost never where the user's files are. New precedence: explicit `cwd` argument > configured `cwd` > calling session's cwd (`agent.session.meta.cwd ?? agent.options.cwd`, same resolution dsh-claude-driver uses) > `process.cwd()` as the last resort.
 - **dontAsk trap documented at every surface the model reads.** Delegated sessions are headless, so `permissionMode: 'dontAsk'` silently denies every confirmation prompt and the task predictably fails unless paired with an `allowedTools` whitelist. Not hard-blocked (whitelist + deny-the-rest is a legitimate strict-sandbox pattern), but the tool schema, the config description and the delegation skill now all warn and steer to `acceptEdits`.
