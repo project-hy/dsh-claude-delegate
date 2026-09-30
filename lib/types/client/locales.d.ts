@@ -60,6 +60,7 @@ export declare const zh: {
     'events.result': string;
     'error.prefix': string;
     'select.empty': string;
+    'select.sources': string;
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<keyof typeof zh, string>;

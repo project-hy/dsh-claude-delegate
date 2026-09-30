@@ -99,6 +99,12 @@ interface PanelState {
   selected?: string
   outputs: Map<string, OutputState>
   events: Map<string, EventState>
+  /**
+   * Last known row list. A tab switch unmounts the view and the rosters do not
+   * necessarily hand back settled jobs on re-subscribe, so without this the tab
+   * strip could come back blank while the jobs were still there on the host.
+   */
+  rows?: readonly JobView[]
 }
 
 const panels = new Map<string, PanelState>()
@@ -185,7 +191,8 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
     // the plugin's own tracker list below is the last-resort source.
     const native = (jobs?.state ?? NO_ROSTER)((state) => state.rows[sessionId])
     const mirrored = useSessions((state) => state.jobsBySession?.[sessionId]) ?? NO_JOBS
-    const [tracked, setTracked] = useState<readonly JobView[]>(NO_JOBS)
+    const panel = panelOf(sessionId)
+    const [tracked, setTracked] = useState<readonly JobView[]>(() => panel.rows ?? NO_JOBS)
     // Merged, not either/or: the plugin's own tracker list is the one source
     // that cannot lag a job's start, so a running delegation is listed — and its
     // live reads begin — within one poll even when the harness roster is empty
@@ -207,8 +214,18 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
       let alive = true
       const load = () => {
         api.listJobs(sessionId).then(
-          (list) => { if (alive) setTracked(list.map(trackedRow)) },
-          () => {},
+          (list) => {
+            if (!alive) return
+            const mapped = list.map(trackedRow)
+            setTracked(mapped)
+            panel.rows = mapped
+          },
+          // Never swallow this: an empty tab strip is exactly what a failing
+          // list RPC looks like, and silence made it undiagnosable.
+          (failure: unknown) => {
+            if (!alive) return
+            setError(`${t('error.prefix')}: ${failure instanceof Error ? failure.message : String(failure)}`)
+          },
         )
       }
       load()
@@ -216,7 +233,12 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
       return () => { alive = false; clearInterval(timer) }
     }, [api, native, sessionId])
 
-    const panel = panelOf(sessionId)
+    // Remember what the tab strip showed, so a later mount paints the same rows
+    // instead of an empty strip if both rosters are quiet at that moment.
+    useEffect(() => {
+      if (rows.length > 0) panel.rows = rows
+    }, [rows, panel])
+
     // Seeded from the cached choice (tab switch) or the default pick, so the
     // first paint already shows a job instead of the "pick one" placeholder.
     const [selected, setSelected] = useState<string | undefined>(() => panel.selected ?? defaultSelection(rows))
@@ -426,7 +448,13 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
 
           <div className={CSS.pane}>
             {current === undefined ? (
-              <div className={CSS.empty}>{t('select.empty')}</div>
+              <div className={CSS.empty}>
+                {t('select.empty')}
+                {/* Row sources, so "nothing listed" is diagnosable at a glance. */}
+                <div className={CSS.emptyTitle}>
+                  {`${t('select.sources')}: roster ${native?.length ?? 0} · tracker ${tracked.length}`}
+                </div>
+              </div>
             ) : (
               <>
                 <div className={CSS.paneHead}>

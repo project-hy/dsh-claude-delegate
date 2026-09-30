@@ -61,6 +61,7 @@ export const zh = {
   'events.result': '完成',
   'error.prefix': '读取失败',
   'select.empty': '选择上方的任务查看输出',
+  'select.sources': '行来源',
 }
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -117,6 +118,7 @@ export const en: Record<keyof typeof zh, string> = {
   'events.result': 'Completed',
   'error.prefix': 'Read failed',
   'select.empty': 'Pick a job above to see its output',
+  'select.sources': 'row sources',
 }
 
 /** Translation key set. */
