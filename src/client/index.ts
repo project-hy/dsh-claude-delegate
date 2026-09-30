@@ -1,5 +1,5 @@
 /**
- * Client half of dsh-claude-code: contributes a third `conversation.view` tab
+ * Client half of dsh-claude-delegate: contributes a third `conversation.view` tab
  * ("Claude Code") next to Chat and Trajectory. Selecting it swaps the whole
  * conversation body for the delegation monitor panel.
  *

@@ -113,7 +113,7 @@ export function toolToneClass(name: string): string {
   return `ccp-evTone${hash % TOOL_TONES}`
 }
 
-const STYLE_ID = 'dsh-claude-code-panel'
+const STYLE_ID = 'dsh-claude-delegate-panel'
 
 const CSS_TEXT = `
 .ccp-root {
@@ -697,7 +697,7 @@ export function installStyles(): void {
   if (document.getElementById(STYLE_ID) !== null) return
   const tag = document.createElement('style')
   tag.id = STYLE_ID
-  tag.dataset['plugin'] = 'dsh-claude-code'
+  tag.dataset['plugin'] = 'dsh-claude-delegate'
   tag.textContent = CSS_TEXT
   document.head.appendChild(tag)
 }

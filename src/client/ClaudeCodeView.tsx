@@ -37,9 +37,9 @@ const JOB_KIND = 'claude-code'
 
 /**
  * Kinds the panel lists: our own delegations plus the harness's `subagent` jobs.
- * An official `subagent_claude_code` run is an ordinary background job, so it is
- * worth seeing here too — its output is read through the harness `observe`
- * stream, not through our tracker.
+ * A native subagent run is an ordinary background job, so it is worth seeing
+ * here too — its output is read through the harness `observe` stream, not
+ * through our tracker.
  */
 const PANEL_KINDS: readonly string[] = [JOB_KIND, 'subagent']
 

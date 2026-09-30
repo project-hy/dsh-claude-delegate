@@ -9,7 +9,7 @@
 # timeoutMs = hard abort (2h); warnTimeoutMs/warnIntervalMs = periodic warnings in the panel (defaults 1h/30m).
 - insert:
     - id: claude-code
-      name: dsh-claude-code
+      name: dsh-claude-delegate
       config:
         model: sonnet
         permissionMode: acceptEdits

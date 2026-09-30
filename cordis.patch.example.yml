@@ -1,11 +1,11 @@
-# dsh-claude-code 自带 bundle 接线（仓库根 cordis.patch.yml）。
+# dsh-claude-delegate 自带 bundle 接线（仓库根 cordis.patch.yml）。
 # 手动安装时，把这段 insert 合并进 profile 的 cordis.patch.yml：
 #   * 不带 proxy：只有本机出网 IP 是数据中心 IP、Anthropic 返回 403 时才加
 #     （proxy 指向没有服务的端口会让每次委派 ECONNREFUSED）。
 #   * 权限用 acceptEdits：委派会话是无头会话，bypassPermissions 等于完全不检查权限。
 - insert:
     - id: claude-code
-      name: dsh-claude-code
+      name: dsh-claude-delegate
       config:
         model: sonnet
         permissionMode: acceptEdits

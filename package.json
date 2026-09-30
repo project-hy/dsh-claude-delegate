@@ -1,7 +1,7 @@
 {
-  "name": "dsh-claude-code",
-  "version": "0.7.1",
-  "description": "DSH tool plugin: delegate a self-contained task to your local Claude Code subscription (via the official Claude Agent SDK).",
+  "name": "dsh-claude-delegate",
+  "version": "0.8.0",
+  "description": "DSH tool plugin: delegate a self-contained task to your local Claude Code subscription (official Agent SDK). Fork of zhangjunjesse/dsh-claude-code, with a live output channel, resume and a monitor panel.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -41,7 +41,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/project-hy/dsh-claude-code.git"
+    "url": "git+https://github.com/project-hy/dsh-claude-delegate.git"
   },
   "keywords": [
     "dsh",

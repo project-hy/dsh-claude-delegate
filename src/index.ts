@@ -25,7 +25,7 @@ export const name = 'claude-code'
 // which bypasses the inject requirement and returns undefined when absent.
 export const inject = ['tools', 'skills']
 
-const CLIENT_APP = 'dsh-claude-code/0.7.1'
+const CLIENT_APP = 'dsh-claude-delegate/0.8.0'
 
 /** Cap for the live-output buffers kept per background job. */
 const MAX_LIVE_BUFFER = 500_000
