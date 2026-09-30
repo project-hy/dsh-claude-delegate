@@ -5,5 +5,7 @@ export interface EventViewProps {
     truncated: boolean;
     /** Identity of the job being shown; changing it re-pins the view to the tail. */
     jobId: string;
+    /** True while the job itself still runs; ticks a tool card whose result is pending. */
+    live?: boolean;
 }
-export declare function EventView({ events, truncated, jobId }: EventViewProps): import("react").JSX.Element;
+export declare function EventView({ events, truncated, jobId, live }: EventViewProps): import("react").JSX.Element;

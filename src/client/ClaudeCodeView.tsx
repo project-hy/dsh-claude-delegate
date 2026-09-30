@@ -3,10 +3,10 @@
  * Claude Code window filling everything below it.
  *
  * The panel is wide but short, so width is what it has to spend and height is
- * what it has to save: the usage bar folds to one line, each delegation is one
- * ellipsised tab (the strip scrolls horizontally once they stop fitting), and
- * everything a tab cannot hold — the full task text, the model, the timings —
- * moves into {@link JobDetailModal} behind the tab's `ⓘ`.
+ * what it has to save: each delegation is one ellipsised tab (the strip scrolls
+ * horizontally once they stop fitting), and everything a tab cannot hold — the
+ * full task text, the model, the timings — moves into {@link JobDetailModal}
+ * behind the tab's `ⓘ`.
  *
  * Two data sources meet here. Job identity and lifecycle come for free from the
  * harness's `session/jobs` push (mirrored into `jobsBySession`), so status
@@ -21,11 +21,10 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ClaudeCodeApi } from './api.js'
-import type { ClaudeEvent, JobInfo, JobStatus, JobView, ViewProps } from './types.js'
+import type { ClaudeEvent, JobInfo, JobStatus, JobView, JobsClient, ViewProps } from './types.js'
 import { EventView } from './EventView.js'
 import { OutputView } from './OutputView.js'
 import { JobDetailModal } from './JobDetailModal.js'
-import { UsageBar, useUsage } from './UsageBar.js'
 import { formatDuration, statusLabel } from './format.js'
 import { CSS } from './styles.js'
 import { t } from './locales.js'
@@ -33,8 +32,47 @@ import { t } from './locales.js'
 /** Stable empty list so a session with no jobs keeps one array identity. */
 const NO_JOBS: readonly JobView[] = []
 
-/** Only this plugin's own delegations belong in the panel. */
+/** This plugin's own delegations; every row it tracks carries this kind. */
 const JOB_KIND = 'claude-code'
+
+/**
+ * Kinds the panel lists: our own delegations plus the harness's `subagent` jobs.
+ * An official `subagent_claude_code` run is an ordinary background job, so it is
+ * worth seeing here too — its output is read through the harness `observe`
+ * stream, not through our tracker.
+ */
+const PANEL_KINDS: readonly string[] = [JOB_KIND, 'subagent']
+
+/** Roster poll period for the plugin's own tracker list. */
+const TRACKED_POLL_MS = 2000
+
+/**
+ * Hook-shaped stand-in for an absent `jobs` service, so the roster hook is
+ * called exactly once per render either way and simply yields `undefined`.
+ */
+const NO_ROSTER: JobsClient['state'] = (select) => select({ rows: {} })
+
+/** Dedupe rows by id, keeping the highest-priority (earliest) copy of each. */
+function mergeRows(...lists: readonly (readonly JobView[])[]): JobView[] {
+  const byId = new Map<string, JobView>()
+  for (const list of lists) {
+    for (const job of list) if (!byId.has(job.id)) byId.set(job.id, job)
+  }
+  return [...byId.values()]
+}
+
+/** Project one tracker row onto the row shape the panel renders. */
+function trackedRow(job: JobInfo): JobView {
+  return {
+    id: job.jobId,
+    kind: JOB_KIND,
+    label: job.label,
+    status: job.status,
+    ...(job.failureDetail !== undefined ? { detail: job.failureDetail } : {}),
+    startedAt: job.startedAt,
+    ...(job.finishedAt !== undefined ? { finishedAt: job.finishedAt } : {}),
+  }
+}
 
 /** Live-output poll period while the selected job runs. */
 const POLL_MS = 1000
@@ -140,10 +178,43 @@ async function copy(text: string): Promise<boolean> {
  * only reachable from the plugin context, so the binding happens at
  * registration time instead of through a prop.
  */
-export function createClaudeCodeView(api: ClaudeCodeApi) {
+export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | undefined) {
   return function ClaudeCodeView({ sessionId, useSessions }: ViewProps) {
+    // 0.2 keeps this session's roster on the `jobs` client service; 0.1.x
+    // mirrored it on the session store at `jobsBySession`. Neither may exist, so
+    // the plugin's own tracker list below is the last-resort source.
+    const native = (jobs?.state ?? NO_ROSTER)((state) => state.rows[sessionId])
     const mirrored = useSessions((state) => state.jobsBySession?.[sessionId]) ?? NO_JOBS
-    const rows = useMemo(() => ordered(mirrored.filter((job) => job.kind === JOB_KIND)), [mirrored])
+    const [tracked, setTracked] = useState<readonly JobView[]>(NO_JOBS)
+    // Merged, not either/or: the plugin's own tracker list is the one source
+    // that cannot lag a job's start, so a running delegation is listed — and its
+    // live reads begin — within one poll even when the harness roster is empty
+    // or late.
+    const rows = useMemo(
+      () => ordered(mergeRows(native ?? NO_JOBS, mirrored, tracked).filter((job) => PANEL_KINDS.includes(job.kind))),
+      [native, mirrored, tracked],
+    )
+
+    // Keeps the 0.2 roster stream open for this session while the panel is up.
+    useEffect(() => {
+      if (jobs?.watchRows === undefined) return undefined
+      return jobs.watchRows(sessionId)
+    }, [jobs, sessionId])
+
+    // Poll the plugin's own tracker list: cheap, and the only roster source that
+    // can never miss a job that just started.
+    useEffect(() => {
+      let alive = true
+      const load = () => {
+        api.listJobs(sessionId).then(
+          (list) => { if (alive) setTracked(list.map(trackedRow)) },
+          () => {},
+        )
+      }
+      load()
+      const timer = setInterval(load, TRACKED_POLL_MS)
+      return () => { alive = false; clearInterval(timer) }
+    }, [api, native, sessionId])
 
     const panel = panelOf(sessionId)
     // Seeded from the cached choice (tab switch) or the default pick, so the
@@ -158,9 +229,6 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
     // Module-level output cache mutates in place; this counter republishes it.
     const [revision, setRevision] = useState(0)
     const bumpRef = useRef(() => { setRevision((value) => value + 1) })
-    // Subscription quota for the bar on top: one read on mount, then a slow
-    // poll. It is independent of the job list, so a failure here never blocks it.
-    const usage = useUsage(api, sessionId)
 
     // Keep the selection valid as jobs appear, settle and age out.
     useEffect(() => {
@@ -172,6 +240,17 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
 
     const current = rows.find((job) => job.id === selected)
     const currentStatus = current?.status
+    // Rows we did not run ourselves (the harness's own `subagent` jobs) have no
+    // tracker entry: their output is read through the harness `observe` stream,
+    // and our own RPCs would only fail on them.
+    const ours = current === undefined || current.kind === JOB_KIND
+    const observed = (jobs?.state ?? NO_ROSTER)((state) => (selected === undefined ? undefined : state.observed?.[selected]))
+
+    useEffect(() => {
+      if (jobs?.observe === undefined || ours || selected === undefined) return undefined
+      return jobs.observe(sessionId, selected)
+    }, [jobs, ours, sessionId, selected])
+
     // Re-fetch metadata whenever a job appears or changes lifecycle state.
     const lifecycle = rows.map((job) => `${job.id}:${job.status}`).join(',')
 
@@ -198,7 +277,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
     // stream the panel renders, and the raw text stream kept as a fallback and
     // as the source for "copy output".
     useEffect(() => {
-      if (selected === undefined) return
+      if (selected === undefined || !ours) return
       const jobId = selected
       const abort = new AbortController()
       let timer: ReturnType<typeof setInterval> | undefined
@@ -253,7 +332,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
         abort.abort()
         if (timer !== undefined) clearInterval(timer)
       }
-    }, [sessionId, selected, currentStatus, panel])
+    }, [sessionId, selected, currentStatus, panel, ours])
 
     // Tick only while something is live, so an idle panel costs nothing.
     const liveCount = rows.filter(isLive).length
@@ -266,10 +345,18 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
 
     const onCancel = useCallback((jobId: string) => {
       if (!window.confirm(t('action.cancel.confirm'))) return
+      const row = rows.find((job) => job.id === jobId)
+      // Official rows are stopped through the harness; ours through our own abort.
+      if (row !== undefined && row.kind !== JOB_KIND && jobs?.kill !== undefined) {
+        Promise.resolve(jobs.kill(sessionId, jobId)).catch((failure: unknown) => {
+          setError(`${t('error.prefix')}: ${failure instanceof Error ? failure.message : String(failure)}`)
+        })
+        return
+      }
       api.cancel(sessionId, jobId).catch((failure: unknown) => {
         setError(`${t('error.prefix')}: ${failure instanceof Error ? failure.message : String(failure)}`)
       })
-    }, [sessionId])
+    }, [sessionId, rows, jobs])
 
     const flashCopied = useCallback((token: string) => {
       setCopied(token)
@@ -289,14 +376,9 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
       void copy(sessionId).then((done) => { if (done) flashCopied('session') })
     }, [flashCopied])
 
-    const usageBar = (
-      <UsageBar usage={usage.usage} loading={usage.loading} error={usage.error} onRefresh={usage.refresh} />
-    )
-
     if (rows.length === 0) {
       return (
         <div className={CSS.root} data-conversation-composer-overlay="">
-          {usageBar}
           <div className={CSS.empty}>
             <div className={CSS.emptyTitle}>{t('list.empty.title')}</div>
             <div>{t('list.empty.hint')}</div>
@@ -308,7 +390,6 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
 
     return (
       <div className={CSS.root} data-conversation-composer-overlay="">
-        {usageBar}
         <div className={CSS.body}>
           {/* One tab per delegation, single line each; the strip scrolls
               horizontally rather than wrapping into a second row. */}
@@ -367,11 +448,18 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
                     still answers for jobs that produced no events at all (a run
                     that failed before its first block, or a settled job restored
                     from `finalOutput`). */}
-                {events !== undefined && events.list.length > 0 ? (
+                {!ours ? (
+                  <>
+                    {observed?.gapBefore === true ? <div className={CSS.error}>{t('events.truncated')}</div> : null}
+                    {observed?.error !== undefined ? <div className={CSS.error}>{observed.error}</div> : null}
+                    <OutputView jobId={current.id} text={observed?.text ?? ''} truncated={false} />
+                  </>
+                ) : events !== undefined && events.list.length > 0 ? (
                   <EventView
                     jobId={current.id}
                     events={events.list}
                     truncated={events.truncated}
+                    live={isLive(current)}
                   />
                 ) : (
                   <OutputView
@@ -390,9 +478,9 @@ export function createClaudeCodeView(api: ClaudeCodeApi) {
                   <button
                     type="button"
                     className={CSS.button}
-                    disabled={(output?.text ?? detail?.finalOutput ?? '') === ''}
+                    disabled={(output?.text ?? detail?.finalOutput ?? observed?.text ?? '') === ''}
                     onClick={() => {
-                      void copy(output?.text ?? detail?.finalOutput ?? '').then((done) => { if (done) flashCopied('output') })
+                      void copy(output?.text ?? detail?.finalOutput ?? observed?.text ?? '').then((done) => { if (done) flashCopied('output') })
                     }}
                   >
                     {copied === 'output' ? t('action.copied') : t('action.copyOutput')}

@@ -35,6 +35,15 @@ export type ClaudeEvent =
   | { type: 'text', text: string }
   | { type: 'thinking', thinking: string, signature?: string }
   | { type: 'tool_use', id?: string, name: string, input: unknown }
+  | { type: 'tool_progress', tool_use_id: string, tool_name: string, elapsedSeconds: number }
+  | {
+    type: 'console'
+    stream: 'stdout' | 'stderr' | 'meta'
+    text: string
+    /** Run id of the channel command, so parallel commands keep separate blocks. */
+    run?: string
+    phase?: 'start' | 'end'
+  }
   | { type: 'tool_result', tool_use_id: string | null, content: string, isError?: boolean }
   | { type: 'result', text: string, costUsd?: number, numTurns?: number, durationMs?: number, isError?: boolean }
   | { type: 'warning', text: string }
@@ -83,6 +92,8 @@ function shrink(event: ClaudeEvent): ClaudeEvent {
       return { ...event, input: cut(encoded) }
     }
     case 'tool_result': return { ...event, content: cut(event.content) }
+    case 'tool_progress': return event
+    case 'console': return { ...event, text: cut(event.text) }
     case 'result': return { ...event, text: cut(event.text) }
     case 'warning': return { ...event, text: cut(event.text) }
   }

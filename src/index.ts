@@ -8,7 +8,10 @@ import { existsSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { JobTracker, createEventBuffer, type ClaudeEvent, type EventBuffer, type TrackedSettlement } from './tracker.js'
 import { ClaudeCodeRemote } from './remote.js'
-import { DEFAULT_STALE_AFTER_MINUTES, readUsageSnapshot, renderUsage } from './usage.js'
+import { DELEGATION_SKILL } from './delegation-skill.js'
+import {
+  createLiveShell, LIVE_SHELL_SERVER, LIVE_SHELL_SYSTEM_RULE, LIVE_SHELL_TOOL_ID, type LiveShell,
+} from './live-shell.js'
 import { delegateModelFor, delegateEffortFor, EFFORT_LEVELS } from './delegate-model.js'
 
 export { delegateModelFor, delegateEffortFor }
@@ -22,7 +25,7 @@ export const name = 'claude-code'
 // which bypasses the inject requirement and returns undefined when absent.
 export const inject = ['tools', 'skills']
 
-const CLIENT_APP = 'dsh-claude-code/0.7.0'
+const CLIENT_APP = 'dsh-claude-code/0.7.1'
 
 /** Cap for the live-output buffers kept per background job. */
 const MAX_LIVE_BUFFER = 500_000
@@ -62,6 +65,10 @@ export interface Config {
   maxBudgetUsd?: number
   appendSystemPrompt?: string
   allowDangerouslySkipPermissions: boolean
+  shellChannel: boolean
+  shellChannelOnly: boolean
+  shellPath?: string
+  shellTimeoutMs?: number
   proxy?: string
   subagents?: Record<string, SubagentConfig>
 }
@@ -90,6 +97,22 @@ export const Config: z<Config> = z.object({
     .description('Thinking mode: adaptive (Claude decides) or disabled. Unset keeps the SDK default.'),
   maxBudgetUsd: z.number().description('Hard USD budget per task; the run stops once it is reached.'),
   appendSystemPrompt: z.string().description("Instructions appended to Claude Code's default system prompt."),
+  shellChannel: z.boolean()
+    .description(
+      'Expose mcp__dsh__shell — a shell tool this plugin owns, so a long command\'s output streams live into the ' +
+      'Claude Code panel. The Agent SDK never forwards a tool\'s stdout (no such message exists; only tool_progress ' +
+      'heartbeats), because the CLI keeps the Bash pipes to itself. The built-in Bash tool stays available for short ' +
+      'and stateful commands; the injected system prompt routes long ones to the channel.',
+    )
+    .default(true),
+  shellChannelOnly: z.boolean()
+    .description(
+      'Route every command through the live shell channel by denying the built-in Bash tool: 100% live output, at ' +
+      'the cost of shell state (each command is a fresh process, so cd/export do not carry across calls).',
+    )
+    .default(false),
+  shellPath: z.string().description('bash executable for the live shell channel; auto-detected (CLAUDE_CODE_GIT_BASH_PATH, Git on PATH) when omitted.'),
+  shellTimeoutMs: z.number().description('Per-command timeout for the live shell channel (ms); on expiry the whole process tree is killed.').default(900000),
   allowDangerouslySkipPermissions: z.boolean()
     .description('Deliberate safety switch required before permissionMode bypassPermissions is accepted.')
     .default(false),
@@ -154,80 +177,6 @@ function sessionCwd(agent: unknown): string | undefined {
   const a = agent as { session?: { meta?: { cwd?: string } }; options?: { cwd?: string } } | undefined
   const cwd = a?.session?.meta?.cwd ?? a?.options?.cwd
   return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
-}
-
-const DELEGATION_SKILL: SkillRegistration = {
-  name: 'claude-code-delegation',
-  description:
-    'Leader-Worker 流程：把自包含的编码子任务（写/改插件、重构、修 bug 补测试）委派给本机 Claude Code 订阅执行并循环质检。任务需要 Claude Code 自己读文件、跑循环时用它。',
-  whenToUse:
-    '用户要求写/改代码且任务自包含、边界清晰（尤其"让 Claude 来写/修 XX"）；或维护 dsh-claude-code 插件本身时。',
-  source: 'runtime' as const,
-  content: [
-    '# Claude Code 委派 SOP（Leader-Worker）',
-    '',
-    'DSH 是 leader，本机 Claude Code（订阅，走官方 Agent SDK，合规）是 worker。工具：claude_code。',
-    '',
-    '## 何时用 / 何时不用',
-    '- 用：自包含、边界清晰的编码任务（写/改插件、重构、修 bug + 补测试、脚手架）；上下文能从文件系统获得（Claude Code 自带 Read/Edit/Bash/Grep/Glob）。',
-    '- 不用：强依赖 DSH 会话历史或 DSH 生态（subagent/workflow/goal/todo）的任务，自己干。',
-    '',
-    '## 派活规范（任务文本必须包含）',
-    '1. 目标：一句话说清要交付什么。',
-    '2. 文件：相关文件绝对路径。派活前先 read/grep 摸清结构，把结论写进任务。',
-    '3. 约束：构建/验证命令（npm run build、npx tsc）、禁止事项、风格要求。',
-    '4. 验收：明确"做到什么算完成"。',
-    '',
-    '## 循环质检',
-    '- 结果回来必须 review，并亲自跑构建/测试验证，不要直接采信。',
-    '- 不满意就带着具体反馈再派一轮，写清上一轮哪里不对。',
-    '',
-    '## 多轮迭代（resume）',
-    '- 调用返回的 sessionId 就是 Claude Code 的会话句柄。',
-    '- 同一任务继续迭代时，把上次的 sessionId 作为 resume 参数传回，Claude Code 会记住它之前的上下文。',
-    '- resume 失败（会话已被清理）时，去掉 resume 重新派。',
-    '',
-    '## 后台异步任务（run_in_background）',
-    '- 长任务传 run_in_background: true，工具立刻返回 { kind: "background", jobId }，不占用当前这轮。',
-    '- 用 DSH 自带的 job_output 增量读取 Claude Code 的实时输出（每次只给上次之后的新内容），job_list 看在跑的任务，job_kill 取消。',
-    '- 任务结束时 DSH 会自动推送完成通知，不需要轮询。',
-    '- 短任务（几十秒内）直接前台调用即可，前台会把最终文本一次性返回。',
-    '- Web 端还有个「Claude Code」监控面板（会话头第三个标签页）：任务列表 + 原生风格实时输出（工具卡片带参数与结果、思考块可折叠）+ 取消，人类用户可以自己盯，你不用替他转述实时输出。',
-    '',
-    '## 派活前看额度（claude_code_usage）',
-    '- 纯本地读缓存，零 token、毫秒级：拿到 5 小时 / 7 天窗口用量、重置时间、订阅档位和一个 advice（normal / caution / blocked）。',
-    '- advice 是 caution 就少派、别并发；是 blocked 就先别派，告诉用户重置时间。',
-    '- 数据是 claude CLI 的缓存，每次委派后会自动刷新；显示 maybeStale 时按"可能偏低"看待。',
-    '',
-    '## 参数覆盖',
-    '- cwd（工作目录，不传默认跟随主会话的工作目录）、model（sonnet/opus/haiku）、permissionMode（default/acceptEdits/bypassPermissions/plan/dontAsk/auto，默认 acceptEdits）、maxTurns、effort（思考强度 low/medium/high/xhigh/max）、resume。',
-    '- ⚠️ 委派会话是无头的：dontAsk 会静默拒绝一切需要确认的操作（必挂），除非配了 allowedTools 白名单——后台/常规委派一律用 acceptEdits。',
-    '- maxBudgetUsd：本次任务的美元成本上限，超了自动停。',
-    '- appendSystemPrompt：追加到 Claude Code 默认系统提示后面的额外指令（约定风格、禁止事项）。',
-    '- thinkingMode：adaptive（Claude 自己决定思考量）或 disabled（关闭扩展思考）；maxThinkingTokens 是旧参数，仍可用。',
-    '- outputSchema：传一个 JSON Schema，Claude Code 按它产出结构化结果，回到 structuredOutput 字段。',
-    '',
-    '## 自定义 subagents',
-    '- 插件配置里的 subagents（名称 → { description, prompt, tools?, model?, maxTurns? … }）会注册成 Claude Code 内可被 Agent 工具调用的子代理，适合固定的专项角色（如 reviewer、test-writer）。',
-    '',
-    '## 常见故障',
-    '- "claude executable not found"：本机没装 CLI，npm install -g @anthropic-ai/claude-code。',
-    '- 认证失败：在终端手动跑一次 claude 完成登录。',
-    '- 403 / 出网 IP 是数据中心 IP：给插件配置设 proxy（如 http://127.0.0.1:7897），或给 DSH 进程设 HTTPS_PROXY / HTTP_PROXY（指向本机 Clash 等代理）后重启 dsh 再调用。',
-    '- bypassPermissions 报错：这是有意的安全开关，需要在插件配置里显式设 allowDangerouslySkipPermissions: true。',
-    '',
-    '## 超时与告警（两级超时）',
-    '- 硬超时 timeoutMs（默认 2h）：到点自动中止任务（failed timed out）；可用参数覆盖。',
-    '- 告警 warnTimeoutMs（默认 1h）+ 周期 warnIntervalMs（默认 30min）：不中止，只在面板事件流里醒目标注"任务已运行 X"提醒处理。',
-    '- 收到告警且任务无明显进展时：建议让用户决策——继续等 / 取消 / 用 resume 缩小范围重派；不要自作主张强杀。',
-    '## 成本与延迟',
-    '- 每次约 10 秒起步、按订阅计费（小任务实测约 0.1~0.2 美元）。',
-    '- 琐碎小问不派；一个"完整子任务"才派。',
-    '',
-    '## 插件维护（改 dsh-claude-code 本身）',
-    '- 改完源码：npm run build，再按安装方式重新部署（本地：cp -R 覆盖 profile node_modules 下的 dsh-claude-code），最后重启 dsh。',
-    '- 其他用户安装：dsh plugin add dsh-claude-code（npm 包带 bundle manifest，自动接线）。',
-  ].join("\n"),
 }
 
 const PARALLEL_DEV_SKILL: SkillRegistration = {
@@ -375,6 +324,17 @@ function describeFailure(raw: string): string {
   return `claude_code failed: ${detail}`
 }
 
+/**
+ * The one line that makes `resume` usable: without it the session handle stays
+ * inside the structured payload and the model never sees it, so every follow-up
+ * iteration silently starts from zero.
+ */
+function sessionLine(sessionId: unknown): string {
+  return typeof sessionId === 'string' && sessionId !== ''
+    ? `\nsession: ${sessionId} — pass it back as \`resume\` to continue this delegation`
+    : ''
+}
+
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message
   if (typeof err === 'string') return err
@@ -467,6 +427,10 @@ interface RunRequest {
   proxy?: string
   agents?: Record<string, AgentDefinition>
   allowDangerouslySkipPermissions: boolean
+  shellChannel: boolean
+  shellChannelOnly: boolean
+  shellPath?: string
+  shellTimeoutMs?: number
 }
 
 interface RunOutcome {
@@ -481,13 +445,18 @@ interface RunOutcome {
   structuredOutput?: unknown
 }
 
-function buildQueryOptions(req: RunRequest, abort: AbortController): Options {
+function buildQueryOptions(req: RunRequest, abort: AbortController, shell?: LiveShell): Options {
+  // The live shell is pre-approved alongside whatever the caller allowed: an MCP
+  // tool that still needs a permission prompt is a tool that never runs, since a
+  // delegated session is headless and cannot answer one.
+  const allowed = req.allowedTools === undefined ? [] : [...req.allowedTools]
+  if (shell !== undefined && !allowed.includes(LIVE_SHELL_TOOL_ID)) allowed.push(LIVE_SHELL_TOOL_ID)
   const options: Options = {
     cwd: req.cwd,
     model: req.model,
     permissionMode: req.permissionMode as Options['permissionMode'],
     maxTurns: req.maxTurns,
-    allowedTools: req.allowedTools,
+    allowedTools: allowed.length > 0 ? allowed : undefined,
     pathToClaudeCodeExecutable: req.pathToClaudeCodeExecutable,
     resume: req.resume,
     effort: req.effort as Options['effort'],
@@ -508,8 +477,17 @@ function buildQueryOptions(req: RunRequest, abort: AbortController): Options {
   if (req.thinkingMode) options.thinking = { type: req.thinkingMode }
   else if (typeof req.maxThinkingTokens === 'number') options.maxThinkingTokens = req.maxThinkingTokens
   if (typeof req.maxBudgetUsd === 'number') options.maxBudgetUsd = req.maxBudgetUsd
-  if (req.appendSystemPrompt) {
-    options.systemPrompt = { type: 'preset', preset: 'claude_code', append: req.appendSystemPrompt }
+  if (shell !== undefined) {
+    options.mcpServers = { [LIVE_SHELL_SERVER]: shell.server }
+    const disallowed = req.shellChannelOnly ? ['Bash'] : []
+    if (disallowed.length > 0) options.disallowedTools = disallowed
+  }
+  const appended = [
+    req.appendSystemPrompt,
+    shell === undefined ? undefined : LIVE_SHELL_SYSTEM_RULE,
+  ].filter((part): part is string => part !== undefined && part !== '')
+  if (appended.length > 0) {
+    options.systemPrompt = { type: 'preset', preset: 'claude_code', append: appended.join('\n\n') }
   }
   if (req.agents) options.agents = req.agents
   if (req.outputSchema) options.outputFormat = { type: 'json_schema', schema: req.outputSchema }
@@ -543,7 +521,48 @@ async function runClaude(
   const toolsUsed = new Set<string>()
   let failure: string | undefined
 
-  const stream = query({ prompt: req.task, options: buildQueryOptions(req, abort) })
+  // The live shell channel: a shell tool WE own, so a long command's output
+  // reaches the panel as it is produced. The SDK cannot do this for the built-in
+  // Bash tool — it never forwards tool stdout (see live-shell.ts).
+  const live = req.shellChannel
+    ? createLiveShell({
+      cwd: req.cwd,
+      shellPath: req.shellPath,
+      timeoutMs: req.shellTimeoutMs,
+      ...(req.proxy
+        ? {
+          env: {
+            HTTPS_PROXY: req.proxy,
+            HTTP_PROXY: req.proxy,
+            ALL_PROXY: req.proxy,
+            NO_PROXY: process.env.NO_PROXY ?? 'localhost,127.0.0.1',
+          },
+        }
+        : {}),
+      onLine: (line, stream, run) => onEvent?.({ type: 'console', stream, text: line, run }),
+      onStart: (info) => onEvent?.({
+        type: 'console',
+        stream: 'meta',
+        text: `$ ${info.command}`,
+        run: info.run,
+        phase: 'start',
+      }),
+      onEnd: (info) => onEvent?.({
+        type: 'console',
+        stream: 'meta',
+        text: `exit ${info.exitCode} · ${(info.durationMs / 1000).toFixed(1)}s${info.reason === 'timeout' ? ' · 超时终止' : ''}`,
+        run: info.run,
+        phase: 'end',
+      }),
+    })
+    : undefined
+  const killChildren = (): void => live?.killAll()
+  abort.signal.addEventListener('abort', killChildren, { once: true })
+
+  const stream = query({ prompt: req.task, options: buildQueryOptions(req, abort, live) })
+  // Text already streamed to the panel as partial deltas, so the finished block
+  // is not emitted a second time.
+  let deltaText = ''
 
   try {
     for await (const msg of stream) {
@@ -553,7 +572,12 @@ async function runClaude(
         for (const block of msg.message.content as any[]) {
           if (block.type === 'text') {
             output += block.text
-            if (block.text) onEvent?.({ type: 'text', text: block.text })
+            // Partial deltas already painted this text; emit only whatever the
+            // stream did not cover, so the panel never shows it twice.
+            const covered = deltaText.length > 0 && block.text.startsWith(deltaText)
+            const rest = covered ? block.text.slice(deltaText.length) : block.text
+            if (rest) onEvent?.({ type: 'text', text: rest })
+            deltaText = ''
           } else if (block.type === 'thinking') {
             const thinking = typeof block.thinking === 'string' ? block.thinking : ''
             if (thinking) {
@@ -574,6 +598,8 @@ async function runClaude(
             })
           }
         }
+        // A message with no text block still closes the delta run.
+        deltaText = ''
       } else if (msg.type === 'user') {
         // Tool results come back as a user turn. Replays (a resumed session
         // re-emitting its history) would duplicate the panel's stream.
@@ -594,8 +620,23 @@ async function runClaude(
         const event = msg.event as any
         if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
           const text = event.delta.text
-          if (typeof text === 'string' && text) onDelta?.(text)
+          if (typeof text === 'string' && text) {
+            onDelta?.(text)
+            // Same text, second observer: the panel renders it as it arrives so
+            // a long block grows in place instead of landing when it finishes.
+            onEvent?.({ type: 'text', text })
+            deltaText += text
+          }
         }
+      } else if (msg.type === 'tool_progress') {
+        // A tool that runs for minutes reports its own clock; the panel ticks the
+        // card with it, so a long Bash call is visibly alive instead of frozen.
+        onEvent?.({
+          type: 'tool_progress',
+          tool_use_id: msg.tool_use_id,
+          tool_name: msg.tool_name,
+          elapsedSeconds: Number(msg.elapsed_time_seconds ?? 0),
+        })
       } else if (msg.type === 'result') {
         sessionId = msg.session_id
         numTurns = Number(msg.num_turns ?? 0)
@@ -630,6 +671,9 @@ async function runClaude(
     }
   } catch (err) {
     throw new Error(describeFailure(errorText(err)))
+  } finally {
+    abort.signal.removeEventListener('abort', killChildren)
+    killChildren()
   }
 
   // An aborted query can end its stream without throwing. Treat that as a
@@ -709,7 +753,10 @@ function createBuffer() {
 interface JobOutcome {
   status: 'completed' | 'failed' | 'killed'
   detail?: string
+  /** 0.1.x jobs seam read this field. */
   output?: string
+  /** 0.2 jobs seam stores `outcome.result` (`settle()`) and hands it to the model on the first terminal read. */
+  result?: string
 }
 
 /** Everything the tracker needs from inside the job's `run()` closure. */
@@ -724,7 +771,7 @@ interface JobHandles {
 function startBackgroundJob(
   jobs: any,
   req: RunRequest,
-  owner: { id?: string } | undefined,
+  ownerSessionId: string | undefined,
   tracker: JobTracker,
 ): string {
   const timeoutMs = req.timeoutMs
@@ -738,8 +785,15 @@ function startBackgroundJob(
   const jobId: string = jobs.start({
     kind: 'claude-code',
     label,
-    owner,
-    run: () => {
+    // DSH 0.2 resolves this through `agents.get(owner)` and stores the live
+    // Agent, so the spec takes the owning session's ID. Passing the Agent
+    // object itself fails with `session "[object Object]" has no live agent
+    // (background job owner must be live)`.
+    owner: ownerSessionId,
+    // DSH 0.2 streams only what the producer hands to `handle.append()` (or
+    // lists as `spec.output` sources) into the ring behind the model's
+    // `job_output`; the plugin's own buffers feed the monitor panel instead.
+    run: (handle: { append?: (text: string, options?: unknown) => void }) => {
       const abort = new AbortController()
       const pending = createBuffer()
       const full = createBuffer()
@@ -750,10 +804,21 @@ function startBackgroundJob(
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
       let settlement: TrackedSettlement = { status: 'failed' }
+      // What actually reached the seam's ring: its `readBody()` concatenates the
+      // streamed chunks with the settled `result`, so re-sending text the live
+      // stream already delivered would duplicate it.
+      let streamedIntoRing = ''
 
       const onDelta = (text: string) => {
         pending.append(text)
         full.append(text)
+        if (handle?.append) {
+          handle.append(text)
+          // `[tool] …` markers are annotations only this plugin writes into the
+          // text stream; `outcome.output` never contains them, so they must not
+          // count towards the settled-result dedupe below.
+          if (!text.startsWith('\n[tool] ')) streamedIntoRing += text
+        }
       }
 
       const onEvent = (event: ClaudeEvent) => { events.append(event) }
@@ -770,6 +835,12 @@ function startBackgroundJob(
       const done: Promise<JobOutcome> = (async () => {
         try {
           const outcome = await runClaude(req, abort, onDelta, onEvent)
+          // Resume needs the session handle, and a background job is read back
+          // through the seam ring only — so it is appended here instead of being
+          // left in the tracker for the panel alone.
+          if (outcome.sessionId !== '' && handle?.append !== undefined) {
+            handle.append(`\n[session] ${outcome.sessionId} — pass it back as \`resume\` to continue\n`)
+          }
           const cost = typeof outcome.costUsd === 'number' ? `$${outcome.costUsd.toFixed(2)}` : '$0.00'
           const mins = Math.floor(outcome.durationMs / 60000)
           const secs = Math.floor((outcome.durationMs % 60000) / 1000)
@@ -784,7 +855,13 @@ function startBackgroundJob(
           return {
             status: 'completed' as const,
             detail: `${cost} · ${outcome.numTurns} turns · ${mins}m${secs}s`,
+            // `output` is the 0.1.x field name; 0.2's `settle()` stores
+            // `outcome.result` and hands it to the model on the terminal read —
+            // but only for text the live stream did not already deliver.
             output: outcome.output,
+            ...(outcome.output !== undefined && !streamedIntoRing.includes(outcome.output)
+              ? { result: outcome.output }
+              : {}),
           }
         } catch (err) {
           if (cancelled) {
@@ -795,8 +872,14 @@ function startBackgroundJob(
             return { status: 'killed' as const, detail }
           }
           const detail = timedOut ? `timed out after ${timeoutMs}ms` : errorText(err)
-          settlement = { status: 'failed', failureDetail: detail, finalOutput: full.snapshot() }
-          return { status: 'failed' as const, detail, output: full.snapshot() }
+          const partial = full.snapshot()
+          settlement = { status: 'failed', failureDetail: detail, finalOutput: partial }
+          return {
+            status: 'failed' as const,
+            detail,
+            output: partial,
+            ...(!streamedIntoRing.includes(partial) ? { result: partial } : {}),
+          }
         } finally {
           settled = true
           if (timer) clearTimeout(timer)
@@ -851,7 +934,7 @@ function startBackgroundJob(
     const resolved = handles
     tracker.register({
       jobId,
-      ...(owner?.id !== undefined ? { ownerSessionId: owner.id } : {}),
+      ...(ownerSessionId !== undefined ? { ownerSessionId } : {}),
       task: req.task,
       label,
       ...(req.model !== undefined ? { model: req.model } : {}),
@@ -876,67 +959,8 @@ export function apply(ctx: Context, config: Config) {
   // monitor panel (client half) reads it through. Both are process-local and go
   // away with the plugin's fiber.
   const tracker = new JobTracker()
-  // The remote also serves the panel's usage bar, so it gets the same claude
-  // executable the usage tool reads through.
-  new ClaudeCodeRemote(ctx, tracker, config.pathToClaudeCodeExecutable)
+  new ClaudeCodeRemote(ctx, tracker)
 
-  ctx.tools.register(defineTool({
-    name: 'claude_code_usage',
-    description:
-      "Read the local Claude subscription's usage quota (5-hour and 7-day rolling windows, reset times, " +
-      "per-limit severities, plan tier) so you can decide whether another claude_code delegation is safe right now. " +
-      "The data comes from the claude CLI's own cache in ~/.claude.json — reading it is free, local and instant, " +
-      "but it is a cache: every claude_code delegation refreshes it, so it is freshest right after one finishes. " +
-      "No credentials are ever read and no account identity is returned.",
-    parameters: {
-      staleAfterMinutes: {
-        type: 'integer',
-        description: 'Mark the cached data as possibly stale once it is older than this many minutes (default 30).',
-      },
-      forceRefresh: {
-        type: 'boolean',
-        description: 'Reserved: actively refreshing would burn real quota, so it is not supported yet and only adds a warning.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          ok: { type: 'boolean', description: 'True when a usage snapshot could be read.' },
-          loggedIn: { type: 'boolean', description: 'Whether the local claude CLI is currently logged in.' },
-          error: { type: 'string', description: 'Actionable failure reason; present only when ok is false.' },
-          subscription: { type: 'json', description: 'Plan descriptors: { type, rateLimitTier, billingType }.' },
-          fiveHour: { type: 'json', description: 'Five-hour window: { utilizationPercent, resetsAt }.' },
-          sevenDay: { type: 'json', description: 'Seven-day window: { utilizationPercent, resetsAt }.' },
-          limits: { type: 'json', description: 'Per-limit rows: { kind, group, percent, severity, resetsAt, scopeModel, isActive }.' },
-          spend: { type: 'json', description: 'Dollar spend block; disabled on subscription accounts.' },
-          extraUsage: { type: 'json', description: 'Extra-usage credits: { isEnabled, disabledReason }.' },
-          cache: { type: 'json', description: 'Cache freshness: { fetchedAt, ageMinutes, maybeStale, source }.' },
-          advice: {
-            type: 'string',
-            enum: ['normal', 'caution', 'blocked', 'unknown'],
-            description: 'Derived signal: normal, caution (any window >= 80%), blocked (>= 95% or a non-normal severity), unknown.',
-          },
-          warnings: { type: 'array', items: { type: 'string' }, description: 'Degradation notes (stale cache, missing fields, login expired).' },
-        },
-      },
-      render: (_args: any, value: any) => [{ type: 'text', text: renderUsage(value) }],
-    },
-    async execute(args: any) {
-      return readUsageSnapshot({
-        staleAfterMinutes: typeof args.staleAfterMinutes === 'number' ? args.staleAfterMinutes : DEFAULT_STALE_AFTER_MINUTES,
-        forceRefresh: args.forceRefresh === true,
-        ...(config.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: config.pathToClaudeCodeExecutable } : {}),
-      }) as any
-    },
-    presentCall: () => ({
-      card: 'generic',
-      title: 'Claude 订阅额度',
-      kind: 'other',
-      rawInput: {},
-    }),
-  }))
 
   ctx.tools.register(defineTool({
     name: 'claude_code',
@@ -1002,6 +1026,10 @@ export function apply(ctx: Context, config: Config) {
         type: 'string',
         description: 'HTTP proxy for this call (e.g. http://127.0.0.1:7897); overrides the plugin proxy config. Sets HTTPS_PROXY/HTTP_PROXY for the spawned claude.',
       },
+      shellChannelOnly: {
+        type: 'boolean',
+        description: 'Deny the built-in Bash tool for this call so every command goes through the live shell channel (mcp__dsh__shell): 100% live output, but each command is a fresh process and cannot keep shell state (cd/export).',
+      },
       run_in_background: {
         type: 'boolean',
         description: 'Run the delegation as a DSH background job and return a jobId immediately; read live output with job_output, cancel with job_kill.',
@@ -1054,7 +1082,7 @@ export function apply(ctx: Context, config: Config) {
         if (value.structuredOutput !== undefined) {
           text += `\n\nstructured output:\n${JSON.stringify(value.structuredOutput, null, 2)}`
         }
-        return [{ type: 'text', text: `${text}\n\n(${stats})` }]
+        return [{ type: 'text', text: `${text}\n\n(${stats})${sessionLine(value.sessionId)}` }]
       },
     },
     timeoutMs: config.timeoutMs,
@@ -1086,6 +1114,10 @@ export function apply(ctx: Context, config: Config) {
         proxy: args.proxy ?? config.proxy,
         agents: toAgentDefinitions(config.subagents),
         allowDangerouslySkipPermissions: config.allowDangerouslySkipPermissions === true,
+        shellChannel: config.shellChannel !== false,
+        shellChannelOnly: args.shellChannelOnly ?? config.shellChannelOnly === true,
+        shellPath: config.shellPath,
+        shellTimeoutMs: config.shellTimeoutMs,
       }
 
       preflight(req)
@@ -1093,7 +1125,7 @@ export function apply(ctx: Context, config: Config) {
       if (args.run_in_background) {
         const jobs = ctx.get('jobs')
         if (!jobs) throw new Error('background jobs unavailable: load @deepseek-ai/dsh-tool-jobs')
-        const jobId = startBackgroundJob(jobs, req, exec.agent as { id?: string } | undefined, tracker)
+        const jobId = startBackgroundJob(jobs, req, (exec.agent as { id?: string } | undefined)?.id, tracker)
         return { kind: 'background' as const, jobId }
       }
 

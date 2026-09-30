@@ -13,7 +13,7 @@ import { createApi } from './api.js'
 import { createClaudeCodeView } from './ClaudeCodeView.js'
 import { installStyles } from './styles.js'
 import { t } from './locales.js'
-import type { Context } from './types.js'
+import type { Context, JobsClient } from './types.js'
 
 /** Services required before the panel can register (client runtime provides both). */
 export const inject = ['slots', 'connection']
@@ -24,7 +24,13 @@ export const inject = ['slots', 'connection']
  */
 export function apply(ctx: Context): void {
   installStyles()
-  const ClaudeCodeView = createClaudeCodeView(createApi(ctx.connection))
+  // 0.2 moved the background-jobs roster into a first-class client service
+  // (`ctx.jobs`, installed by ui-jobs) and dropped the session store's
+  // `jobsBySession` mirror; the panel reads the service when it is there and
+  // falls back to the mirror otherwise. Looked up rather than injected so the
+  // bundle still loads on a 0.1.x client that has no such service.
+  const jobs = ctx.get?.<JobsClient>('jobs')
+  const ClaudeCodeView = createClaudeCodeView(createApi(ctx.connection), jobs)
   ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
     id: 'claude-code',

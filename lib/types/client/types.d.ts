@@ -24,6 +24,40 @@ export interface SessionListSnapshot {
 }
 /** The `useSessions` selector hook injected into every session-scope slot. */
 export type UseSessions = <T>(select: (state: SessionListSnapshot) => T) => T;
+/**
+ * The 0.2 client `jobs` service (`IJobs`).
+ *
+ * 0.2 replaced the `jobsBySession` session-store mirror with this first-class
+ * service — its rows carry the same fields this panel renders. It is read
+ * lazily through `Context.get` so the bundle still loads on a 0.1.x client,
+ * where the service does not exist at all.
+ */
+export interface JobsClient {
+    /** The roster store hook; `state.rows[sessionId]` is `undefined` until watched. */
+    state: <T>(select: (state: JobsState) => T) => T;
+    /** Keeps one roster stream open for a session; the return value releases it. */
+    watchRows?(sessionId: string): (() => void) | void;
+    /** Opens one job's live output stream; the return value releases it. */
+    observe?(sessionId: string, jobId: string): (() => void) | void;
+    /** Asks the harness to stop a job it owns. */
+    kill?(sessionId: string, jobId: string): Promise<{
+        ok: boolean;
+    }> | {
+        ok: boolean;
+    };
+}
+/** The `jobs` store: this session's roster plus the live output tails it keeps. */
+export interface JobsState {
+    rows: Readonly<Record<string, readonly JobView[]>>;
+    observed?: Readonly<Record<string, ObservedOutput>>;
+}
+/** One job's live output tail, exactly as the harness `observe` stream keeps it. */
+export interface ObservedOutput {
+    text: string;
+    /** True when earlier output was evicted, so `text` is not the whole story. */
+    gapBefore?: boolean;
+    error?: string;
+}
 /** Props the runtime hands a `conversation.view` entry (session scope). */
 export interface ViewProps {
     sessionId: string;
@@ -63,6 +97,12 @@ export interface SlotsService {
 export interface Context {
     slots: SlotsService;
     connection: ConnectionService;
+    /**
+     * Cordis service lookup. Optional on purpose: a hard `inject` entry for the
+     * 0.2-only `jobs` service would stop this bundle from loading at all on a
+     * 0.1.x client, so the plugin looks the service up instead.
+     */
+    get?<T = unknown>(name: string): T | undefined;
 }
 /** One delegation as `claudeCode/listJobs` returns it. */
 export interface JobInfo {
@@ -107,6 +147,17 @@ export type ClaudeEvent = {
     name: string;
     input: unknown;
 } | {
+    type: 'tool_progress';
+    tool_use_id: string;
+    tool_name: string;
+    elapsedSeconds: number;
+} | {
+    type: 'console';
+    stream: 'stdout' | 'stderr' | 'meta';
+    text: string;
+    run?: string;
+    phase?: 'start' | 'end';
+} | {
     type: 'tool_result';
     tool_use_id: string | null;
     content: string;
@@ -128,47 +179,4 @@ export interface ReadEventsResult {
     nextOffset: number;
     truncated: boolean;
     status: 'running' | 'completed' | 'failed' | 'killed';
-}
-/** Go/no-go signal the host derives from the windows and the limit severities. */
-export type UsageAdvice = 'normal' | 'caution' | 'blocked' | 'unknown';
-/** One rolling quota window (5h / 7d) as the usage bar renders it. */
-export interface UsageWindowView {
-    utilizationPercent: number | null;
-    resetsAt: string | null;
-}
-/** One `limits[]` row; a non-null `scopeModel` makes it a per-model limit. */
-export interface UsageLimitView {
-    kind: string;
-    group: string | null;
-    percent: number | null;
-    severity: string | null;
-    resetsAt: string | null;
-    scopeModel: string | null;
-    isActive: boolean;
-}
-/**
- * The quota snapshot as `claudeCode/usage` returns it (host `UsageSnapshotWire`).
- *
- * Absence is always `null`, never `undefined` — the gateway refuses to encode
- * `undefined`, and `api.getUsage` re-validates every field anyway.
- */
-export interface UsageView {
-    ok: boolean;
-    loggedIn: boolean;
-    error: string | null;
-    subscription: {
-        type: string | null;
-        rateLimitTier: string | null;
-        billingType: string | null;
-    };
-    fiveHour: UsageWindowView | null;
-    sevenDay: UsageWindowView | null;
-    limits: UsageLimitView[];
-    advice: UsageAdvice;
-    cache: {
-        fetchedAt: string | null;
-        ageMinutes: number | null;
-        maybeStale: boolean;
-    };
-    warnings: string[];
 }

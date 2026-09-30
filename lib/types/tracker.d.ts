@@ -41,6 +41,18 @@ export type ClaudeEvent = {
     name: string;
     input: unknown;
 } | {
+    type: 'tool_progress';
+    tool_use_id: string;
+    tool_name: string;
+    elapsedSeconds: number;
+} | {
+    type: 'console';
+    stream: 'stdout' | 'stderr' | 'meta';
+    text: string;
+    /** Run id of the channel command, so parallel commands keep separate blocks. */
+    run?: string;
+    phase?: 'start' | 'end';
+} | {
     type: 'tool_result';
     tool_use_id: string | null;
     content: string;

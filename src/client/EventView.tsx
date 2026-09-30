@@ -1,11 +1,13 @@
 /**
  * Native-style rendering of one delegation's structured event stream.
  *
- * The host emits one event per completed content block (text / thinking /
- * tool_use / tool_result / result); this component turns that flat, append-only
- * list into the shape a Claude Code terminal shows: plain text, collapsed
- * thinking, and a tool card that owns the result it produced. Grouping is by
- * `tool_use_id`, so parallel tool calls still land under their own card.
+ * The host emits text both as partial deltas (the panel paints while the block
+ * is still being written) and, for whatever the deltas missed, as the finished
+ * block; thinking / tool_use / tool_result / result follow per block. This
+ * component turns that flat, append-only list into the shape a Claude Code
+ * terminal shows: plain text, collapsed thinking, and a tool card that owns the
+ * result it produced. Grouping is by `tool_use_id`, so parallel tool calls still
+ * land under their own card, and adjacent text events merge into one node.
  *
  * Everything long is collapsed by default — parameters to one line, results to
  * a few hundred characters — because a delegation easily emits megabytes and
@@ -25,6 +27,10 @@ const MAX_RENDER_EVENTS = 1000
 const PARAM_PREVIEW = 200
 /** Collapsed length of a tool_result body. */
 const RESULT_PREVIEW = 800
+/** Console lines kept per block in the DOM (the stream itself keeps them all). */
+const MAX_CONSOLE_LINES = 400
+/** Our own shell tool: its result is the same text the console group streamed. */
+const SHELL_TOOL = 'mcp__dsh__shell'
 /** How close to the bottom still counts as "following the tail". */
 const STICKY_SLACK_PX = 24
 
@@ -33,10 +39,17 @@ interface ResultNode {
   isError: boolean
 }
 
+interface ConsoleLine {
+  text: string
+  err: boolean
+}
+
 type Node =
   | { kind: 'text', key: string, text: string }
   | { kind: 'thinking', key: string, thinking: string }
-  | { kind: 'tool', key: string, name: string, preview: string, full: string, results: ResultNode[] }
+  | { kind: 'tool', key: string, name: string, preview: string, full: string, results: ResultNode[], progress?: number }
+  | { kind: 'console', key: string, lines: ConsoleLine[], footer?: string }
+  | { kind: 'meta', key: string, text: string }
   | { kind: 'orphanResult', key: string, result: ResultNode }
   | { kind: 'result', key: string, summary: string, isError: boolean }
   | { kind: 'warning', key: string, text: string }
@@ -47,6 +60,8 @@ export interface EventViewProps {
   truncated: boolean
   /** Identity of the job being shown; changing it re-pins the view to the tail. */
   jobId: string
+  /** True while the job itself still runs; ticks a tool card whose result is pending. */
+  live?: boolean
 }
 
 /** One-line preview plus the pretty-printed full form of a tool's parameters. */
@@ -63,6 +78,21 @@ function formatInput(input: unknown): { preview: string, full: string } {
     full = compact
   }
   return { preview: compact, full }
+}
+
+/**
+ * Our shell tool's parameters, read as a sentence instead of JSON: the card then
+ * reads `面板实时输出验证 — echo "tick-1" …` rather than a quoted blob, and the
+ * command is not repeated a second time in the terminal block below it.
+ */
+function shellParams(input: unknown): { preview: string, full: string } {
+  const formatted = formatInput(input)
+  if (input === null || typeof input !== 'object') return formatted
+  const record = input as Record<string, unknown>
+  const command = typeof record['command'] === 'string' ? record['command'] : ''
+  if (command === '') return formatted
+  const purpose = typeof record['purpose'] === 'string' ? record['purpose'] : ''
+  return { preview: purpose === '' ? command : `${purpose} — ${command}`, full: formatted.full }
 }
 
 /** `3m20s` / `12s`, matching the detail line the jobs seam prints. */
@@ -87,13 +117,22 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
   const nodes: Node[] = []
   /** tool_use_id → index of its card in `nodes`. */
   const byToolUse = new Map<string, number>()
+  /** Index of the console block still collecting lines, if any. */
+  let openConsole: number | undefined
+  /** run id → index of that command's console block (parallel commands). */
+  const byRun = new Map<string, number>()
 
   events.forEach((event, index) => {
     const key = `e${index}`
     switch (event.type) {
       case 'text': {
         if (event.text.trim() === '') break
-        nodes.push({ kind: 'text', key, text: event.text })
+        // Text arrives both as partial deltas and (for what they missed) as the
+        // finished block, so one node per run keeps Markdown parsing and the raw
+        // toggle per paragraph instead of per token.
+        const last = nodes[nodes.length - 1]
+        if (last !== undefined && last.kind === 'text') last.text += event.text
+        else nodes.push({ kind: 'text', key, text: event.text })
         break
       }
       case 'thinking': {
@@ -101,15 +140,66 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
         break
       }
       case 'tool_use': {
-        const { preview, full } = formatInput(event.input)
+        const { preview, full } = event.name === SHELL_TOOL ? shellParams(event.input) : formatInput(event.input)
         nodes.push({ kind: 'tool', key, name: event.name, preview, full, results: [] })
         if (event.id !== undefined) byToolUse.set(event.id, nodes.length - 1)
         break
       }
+      case 'tool_progress': {
+        // The CLI reports the running clock of a long tool; the card ticks with
+        // it, so a Bash call that takes minutes is visibly alive, not frozen.
+        const at = byToolUse.get(event.tool_use_id)
+        const owner = at === undefined ? undefined : nodes[at]
+        if (owner !== undefined && owner.kind === 'tool') owner.progress = event.elapsedSeconds
+        break
+      }
+      case 'console': {
+        // The channel writes one event per line, framed by `meta` start/end
+        // events that carry the run id. All of a command's output folds into ONE
+        // node, keyed by that id, so a second command running in the same turn
+        // cannot have its lines land in the first one's block.
+        if (event.text === '') break
+        const run = event.run
+        const known = run === undefined ? undefined : byRun.get(run)
+        const at = known ?? openConsole
+        const open = at === undefined ? undefined : nodes[at]
+        if (event.stream === 'meta') {
+          if (event.phase === 'start' || (event.phase === undefined && event.text.startsWith('$ '))) {
+            nodes.push({ kind: 'console', key, lines: [] })
+            const index = nodes.length - 1
+            if (run !== undefined) byRun.set(run, index)
+            openConsole = index
+            break
+          }
+          if (open !== undefined && open.kind === 'console' && open.footer === undefined) {
+            open.footer = event.text
+            if (run !== undefined) byRun.delete(run)
+            if (at === openConsole) openConsole = undefined
+            break
+          }
+          nodes.push({ kind: 'meta', key, text: event.text })
+          break
+        }
+        const err = event.stream === 'stderr'
+        if (open !== undefined && open.kind === 'console' && open.footer === undefined) open.lines.push({ text: event.text, err })
+        else {
+          nodes.push({ kind: 'console', key, lines: [{ text: event.text, err }] })
+          const index = nodes.length - 1
+          if (run !== undefined) byRun.set(run, index)
+          openConsole = index
+        }
+        break
+      }
       case 'tool_result': {
-        const result: ResultNode = { content: event.content, isError: event.isError === true }
         const at = event.tool_use_id === null ? undefined : byToolUse.get(event.tool_use_id)
         const owner = at === undefined ? undefined : nodes[at]
+        // A succeeded channel command already streamed every line into its own
+        // terminal block; repeating the same text as a tool result made the
+        // panel show the output twice. Failures (timeout / spawn / no bash) keep
+        // their result, because those never produced a console block.
+        if (owner !== undefined && owner.kind === 'tool' && owner.name === SHELL_TOOL
+          && event.content.trimStart().startsWith('exit ')) break
+        const result: ResultNode = { content: event.content, isError: event.isError === true }
         if (owner !== undefined && owner.kind === 'tool') owner.results.push(result)
         else nodes.push({ kind: 'orphanResult', key, result })
         break
@@ -128,7 +218,7 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
   return nodes
 }
 
-export function EventView({ events, truncated, jobId }: EventViewProps) {
+export function EventView({ events, truncated, jobId, live = false }: EventViewProps) {
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const [following, setFollowing] = useState(true)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
@@ -238,6 +328,37 @@ export function EventView({ events, truncated, jobId }: EventViewProps) {
             return renderResult(`${node.key}:r0`, node.result)
           }
 
+          if (node.kind === 'console') {
+            // One command = one terminal block: every line the channel streamed,
+            // in order, stderr tinted; `exit …` closes it as a dim footer.
+            const shown = node.lines.length > MAX_CONSOLE_LINES ? node.lines.slice(-MAX_CONSOLE_LINES) : node.lines
+            const cut = shown.length < node.lines.length
+            const failed = node.footer !== undefined && !/^exit 0\b/.test(node.footer)
+            return (
+              <div key={node.key} className={CSS.evConsole}>
+                <div className={CSS.evConsoleHead}>
+                  {t('events.shellOut')}
+                  {cut ? ` · ${t('events.truncated')}` : ''}
+                </div>
+                <pre className={CSS.evConsoleBody}>
+                  {shown.map((line, at) => (
+                    <span key={at} className={line.err ? CSS.evConsoleErr : undefined}>
+                      {line.text}
+                      {'\n'}
+                    </span>
+                  ))}
+                </pre>
+                {node.footer === undefined ? null : (
+                  <div className={failed ? `${CSS.evConsoleMeta} ${CSS.evConsoleErr}` : CSS.evConsoleMeta}>{node.footer}</div>
+                )}
+              </div>
+            )
+          }
+
+          if (node.kind === 'meta') {
+            return <div key={node.key} className={CSS.evConsoleMeta}>{node.text}</div>
+          }
+
           if (node.kind === 'result') {
             return (
               <div key={node.key} className={node.isError ? `${CSS.evResult} ${CSS.evToolError}` : CSS.evResult}>
@@ -271,6 +392,11 @@ export function EventView({ events, truncated, jobId }: EventViewProps) {
                     {long ? `${node.preview.slice(0, PARAM_PREVIEW)}…` : node.preview}
                   </span>
                 )}
+                {node.results.length === 0 && (node.progress !== undefined || live) ? (
+                  <span className={CSS.evToolParams}>
+                    ⏳ {t('events.toolRunning')}{node.progress !== undefined ? ` ${formatDuration(node.progress * 1000)}` : ''}…
+                  </span>
+                ) : null}
               </button>
               {open && node.full !== '' ? <pre className={CSS.evToolParamsFull}>{node.full}</pre> : null}
               {node.results.map((result, index) => renderResult(`${node.key}:r${index}`, result))}

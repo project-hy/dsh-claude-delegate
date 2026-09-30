@@ -32,6 +32,10 @@ export interface Config {
     maxBudgetUsd?: number;
     appendSystemPrompt?: string;
     allowDangerouslySkipPermissions: boolean;
+    shellChannel: boolean;
+    shellChannelOnly: boolean;
+    shellPath?: string;
+    shellTimeoutMs?: number;
     proxy?: string;
     subagents?: Record<string, SubagentConfig>;
 }

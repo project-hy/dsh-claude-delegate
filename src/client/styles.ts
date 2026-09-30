@@ -13,37 +13,6 @@
 export const CSS = {
   root: 'ccp-root',
   body: 'ccp-body',
-  usage: 'ccp-usage',
-  usageHead: 'ccp-usageHead',
-  usageToggle: 'ccp-usageToggle',
-  usageMini: 'ccp-usageMini',
-  usageCaret: 'ccp-usageCaret',
-  usageDetail: 'ccp-usageDetail',
-  usagePlan: 'ccp-usagePlan',
-  usageTier: 'ccp-usageTier',
-  usageCache: 'ccp-usageCache',
-  usageStale: 'ccp-usageStale',
-  usageSpacer: 'ccp-usageSpacer',
-  usageBadge: 'ccp-usageBadge',
-  usageBadgeNormal: 'ccp-usageBadgeNormal',
-  usageBadgeCaution: 'ccp-usageBadgeCaution',
-  usageBadgeBlocked: 'ccp-usageBadgeBlocked',
-  usageBadgeUnknown: 'ccp-usageBadgeUnknown',
-  usageAdvice: 'ccp-usageAdvice',
-  usageRefresh: 'ccp-usageRefresh',
-  usageBars: 'ccp-usageBars',
-  usageRow: 'ccp-usageRow',
-  usageRowLabel: 'ccp-usageRowLabel',
-  usageTrack: 'ccp-usageTrack',
-  usageFill: 'ccp-usageFill',
-  usageFillWarn: 'ccp-usageFillWarn',
-  usageFillDanger: 'ccp-usageFillDanger',
-  usageRowMeta: 'ccp-usageRowMeta',
-  usageChips: 'ccp-usageChips',
-  usageChipsLabel: 'ccp-usageChipsLabel',
-  usageChip: 'ccp-usageChip',
-  usageNote: 'ccp-usageNote',
-  usageError: 'ccp-usageError',
   tabs: 'ccp-tabs',
   tab: 'ccp-tab',
   tabActive: 'ccp-tabActive',
@@ -111,6 +80,11 @@ export const CSS = {
   evToolResultHead: 'ccp-evToolResultHead',
   evToolResultBody: 'ccp-evToolResultBody',
   evToolError: 'ccp-evToolError',
+  evConsole: 'ccp-evConsole',
+  evConsoleHead: 'ccp-evConsoleHead',
+  evConsoleBody: 'ccp-evConsoleBody',
+  evConsoleErr: 'ccp-evConsoleErr',
+  evConsoleMeta: 'ccp-evConsoleMeta',
   evResult: 'ccp-evResult',
   evWarning: 'ccp-evWarning',
   evMore: 'ccp-evMore',
@@ -155,7 +129,7 @@ const CSS_TEXT = `
   font-size: 13px;
 }
 .ccp-root * { box-sizing: border-box; }
-/* Task tab strip on top, output pane below; the usage bar sits above both. */
+/* Task tab strip on top, output pane below. */
 .ccp-body {
   display: flex;
   flex-direction: column;
@@ -164,158 +138,6 @@ const CSS_TEXT = `
   min-height: 0;
 }
 
-/* --- usage bar --- */
-.ccp-usage {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex: none;
-  padding: 3px 8px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 8px;
-  background: var(--dsw-alias-fill-l1);
-}
-/* One compact line: nothing here may wrap, so the bar stays 24px tall. */
-.ccp-usageHead {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  font-size: 12px;
-  line-height: 18px;
-  white-space: nowrap;
-}
-/* The whole line is the expander; the refresh button sits outside it. */
-.ccp-usageToggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-  padding: 2px 0;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-size: 12px;
-  line-height: 18px;
-  text-align: left;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.ccp-usageToggle:hover { color: var(--dsw-alias-label-primary); }
-.ccp-usageMini {
-  color: var(--dsw-alias-label-secondary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-.ccp-usageCaret {
-  flex: none;
-  color: var(--dsw-alias-label-tertiary);
-  font-size: 10px;
-}
-.ccp-usageDetail {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-bottom: 4px;
-}
-.ccp-usagePlan { font-weight: 600; color: var(--dsw-alias-label-primary); }
-.ccp-usageTier { color: var(--dsw-alias-label-secondary); }
-.ccp-usageCache {
-  color: var(--dsw-alias-label-tertiary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-.ccp-usageStale { color: var(--dsw-alias-state-warning, #c98a2e); }
-.ccp-usageSpacer { flex: 1; }
-.ccp-usageBadge {
-  flex: none;
-  padding: 1px 8px;
-  border: 1px solid currentColor;
-  border-radius: 999px;
-  font-size: 11px;
-  line-height: 16px;
-  font-weight: 600;
-}
-.ccp-usageBadgeNormal { color: var(--dsw-alias-state-success, #3d9970); }
-.ccp-usageBadgeCaution { color: var(--dsw-alias-state-warning, #c98a2e); }
-.ccp-usageBadgeBlocked { color: var(--dsw-alias-state-error, #d05353); }
-.ccp-usageBadgeUnknown { color: var(--dsw-alias-label-tertiary); }
-.ccp-usageAdvice {
-  color: var(--dsw-alias-label-tertiary);
-  font-size: 11px;
-  line-height: 16px;
-}
-.ccp-usageRefresh {
-  flex: none;
-  padding: 1px 8px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--dsw-alias-label-secondary);
-  font: inherit;
-  font-size: 11px;
-  line-height: 16px;
-  cursor: pointer;
-}
-.ccp-usageRefresh:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
-.ccp-usageRefresh:disabled { opacity: 0.5; cursor: default; }
-.ccp-usageBars { display: flex; flex-direction: column; gap: 4px; }
-.ccp-usageRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  line-height: 16px;
-  color: var(--dsw-alias-label-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-.ccp-usageRowLabel { flex: none; width: 56px; }
-.ccp-usageTrack {
-  flex: 1;
-  min-width: 60px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--dsw-alias-fill-l2);
-  overflow: hidden;
-}
-.ccp-usageFill {
-  height: 100%;
-  border-radius: 999px;
-  background: var(--dsw-alias-state-business-primary);
-  transition: width 240ms ease;
-}
-.ccp-usageFillWarn { background: var(--dsw-alias-state-warning, #c98a2e); }
-.ccp-usageFillDanger { background: var(--dsw-alias-state-error, #d05353); }
-.ccp-usageRowMeta { flex: none; white-space: nowrap; }
-.ccp-usageChips {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  font-size: 11px;
-  line-height: 16px;
-}
-.ccp-usageChipsLabel { color: var(--dsw-alias-label-tertiary); }
-.ccp-usageChip {
-  padding: 0 6px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 999px;
-  background: var(--dsw-alias-fill-l2);
-  color: var(--dsw-alias-label-secondary);
-  font-variant-numeric: tabular-nums;
-}
-.ccp-usageNote {
-  color: var(--dsw-alias-label-tertiary);
-  font-size: 11px;
-  line-height: 16px;
-}
-.ccp-usageError {
-  color: var(--dsw-alias-state-error, #d05353);
-  font-size: 11px;
-  line-height: 16px;
-}
 /* --- task tab strip --- */
 .ccp-tabs {
   display: flex;
@@ -741,6 +563,46 @@ const CSS_TEXT = `
   color: var(--dsw-alias-label-secondary);
 }
 .ccp-evToolError { color: var(--dsw-alias-state-error, #d05353); }
+
+/* --- live shell channel (mcp__dsh__shell): the command's own output, live --- */
+.ccp-evConsole {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-fill-l1);
+  overflow: hidden;
+}
+.ccp-evConsoleHead {
+  padding: 3px 8px;
+  background: var(--dsw-alias-fill-l2);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.ccp-evConsoleBody {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+/* The channel's header/footer lines ($ command / exit 0 · 12.3s): dim, no box. */
+.ccp-evConsoleMeta {
+  font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ccp-evConsoleErr { color: var(--dsw-alias-state-error, #d05353); }
 .ccp-evWarning {
   padding: 6px 10px;
   border: 1px solid var(--dsw-alias-state-warning, #c98a1f);
