@@ -2,283 +2,349 @@
 
 # dsh-claude-delegate
 
-> 把一件**说得清的编码活**交给本机 Claude Code 干完，结果拿回来。
->
-> 基于原插件 [zhangjunjesse/dsh-claude-code](https://github.com/zhangjunjesse/dsh-claude-code) 改造（见 [它是从哪来的](#它是从哪来的)）。
+DeepSeek Harness（以下简称 DSH）工具插件：将**边界清晰、自包含的编码子任务**委派给本机 Claude Code 执行，并回收结构化结果。
 
-装上之后，DSH 多一个工具 `claude_code`、多一个 **Claude Code 面板**。分工很直白：DSH 决定"做什么、做到什么算对"，Claude Code 负责"把代码读遍、改完、跑通"。
+插件安装后向 DSH 注册一个工具 `claude_code` 与一个监控面板。DSH 负责定义任务目标与验收标准，Claude Code 负责在指定工作目录内完成代码阅读、修改与验证。插件通过官方 [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) 驱动本机安装的 `claude` CLI，**不提取、不转发任何 OAuth 凭据**。
 
-全程用官方 [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) 驱动你本机那份 `claude` CLI——**不碰 OAuth token**，走的是你已有的订阅。
-
-支持的 DSH 线：**0.1.0-rc.6 → 0.2.0-rc.2**（peer 范围 `>=0.1.0-rc.6 <0.3.0`，已在 `@deepseek-ai/dsh-*@0.2.0-rc.2` 上 typecheck/build 双绿）。
+本文档依次说明功能特性、安装与配置、参数语义、运行机制、故障处置与开发方式。
 
 ---
 
-## 它是从哪来的
+## 目录
 
-上游是 **[zhangjunjesse/dsh-claude-code](https://github.com/zhangjunjesse/dsh-claude-code)**，npm 上只发到 0.1.2 就停了；本仓库（[project-hy/dsh-claude-delegate](https://github.com/project-hy/dsh-claude-delegate)）在它 0.6.0 的基础上继续做。为了不和上游撞名，**包名与仓库名都改成 `dsh-claude-delegate`**（上游仍保留在 `upstream` remote，想取它的更新就 `git fetch upstream`）。
+1. [功能特性](#1-功能特性)
+2. [系统要求与兼容性](#2-系统要求与兼容性)
+3. [安装](#3-安装)
+4. [快速开始](#4-快速开始)
+5. [工具参数参考](#5-工具参数参考)
+6. [插件配置参考](#6-插件配置参考)
+7. [监控面板](#7-监控面板)
+8. [长命令实时输出通道](#8-长命令实时输出通道)
+9. [内置技能](#9-内置技能)
+10. [安全与合规](#10-安全与合规)
+11. [运行机制](#11-运行机制)
+12. [故障排查](#12-故障排查)
+13. [常见问题](#13-常见问题)
+14. [派生来源与改动说明](#14-派生来源与改动说明)
+15. [开发与发布](#15-开发与发布)
+16. [许可证](#16-许可证)
 
-在原有基础上做的事：
+---
 
-| | |
+## 1. 功能特性
+
+| 特性 | 说明 |
 |---|---|
-| **适配 DSH 0.2**（0.2.0-rc.2） | 作业 owner 传 session id、结算文本走 `outcome.result`、客户端从 `ctx.jobs` 读 roster、逐字增量进事件流 |
-| **新增长命令实时通道** | `mcp__dsh__shell`：SDK 从不转发工具 stdout，所以自建一条由插件自己 spawn 的通道，输出逐行进面板 |
-| **新增监控面板** | 任务 tab 条 + 结构化过程（思考块 / 工具卡片 / Markdown 预览）+ 终端输出块 + 一键取消；并修掉切 tab 后任务行消失的问题 |
-| **修 `resume`** | 结果正文末尾回传 `session: <id>`，前台与后台都能续跑 |
-| **技能改为运行时注册** | 从"往用户目录放一份副本"改成装插件即装技能，不会再有两份说明书漂移 |
-| **删掉额度/用量那一块** | `claude_code_usage` 工具、面板额度栏、usage RPC 与模块全部移除 |
-| **清掉随包的不安全默认值** | 上游随包的接线里带着作者开发机的 `proxy: 127.0.0.1:7897` 与 `bypassPermissions`（前者在本机必然 `ECONNREFUSED`，后者等于委派出去的子进程没有任何权限确认），本仓库改为安全默认并写进注释 |
+| **完整参数控制** | 模型、思考强度、权限模式、允许工具、轮次上限、预算上限、超时、追加系统提示、自定义 subagent 均可按次指定 |
+| **后台异步执行** | `run_in_background: true` 立即返回 `jobId`，通过 DSH 原生作业工具增量读取输出，完成后收到通知 |
+| **跨轮次续跑** | 结果正文末尾回传 `session: <id>`，将其作为 `resume` 参数传回即可在同一 Claude Code 会话中继续 |
+| **长命令实时输出** | 内置独立 shell 通道 `mcp__dsh__shell`，长时间运行的构建/测试命令逐行实时进入面板 |
+| **结构化输出** | 传入 JSON Schema（`outputSchema`）即返回符合该模式的 `structuredOutput` |
+| **成本可计量** | 结果包含费用、Token 用量与轮次统计，支持 `maxBudgetUsd` 硬上限 |
+| **监控面板** | 会话内新增「Claude Code」标签页：任务列表、结构化过程视图、实时输出块、一键取消 |
+| **运行时技能注册** | 随插件注册 `claude-code-delegation` 与 `parallel-dev` 技能，安装插件即安装技能，无需在用户目录维护副本 |
 
----
+## 2. 系统要求与兼容性
 
-## 30 秒上手
+| 项 | 要求 |
+|---|---|
+| DSH 版本 | `>=0.1.0-rc.6 <0.3.0`，已在 `@deepseek-ai/dsh-*@0.2.0-rc.2` 上完成类型检查与构建验证 |
+| Node.js | 与 DSH 运行时一致（本仓库使用 Node.js 24 验证） |
+| Claude Code CLI | 需在本机安装并完成登录：`npm install -g @anthropic-ai/claude-code` |
+| 后台作业 | 依赖 DSH 的作业服务（`dsh-tool-jobs`）；未提供时后台模式返回 `background jobs unavailable` |
+| Shell 通道 | 需要 POSIX bash；Windows 下建议安装 Git for Windows 并使用其 `bash.exe` |
+
+## 3. 安装
+
+推荐通过 DSH 插件命令安装（包内自带 `dsh.bundle` 接线清单，安装后自动接线）：
 
 ```bash
-dsh plugin --profile web add dsh-claude-delegate   # 插件自带接线清单，装完自动接好
-# 重启 dsh
+dsh plugin --profile <profile> add dsh-claude-delegate
 ```
 
-然后让模型干活时直说就行：
+等价的手动方式：
 
-```
-用 claude_code 把 src/parser.ts 里 parse() 对空输入崩溃的问题修掉，补一个单测，
-cwd 用 /path/to/repo
-```
-
-它给回来的正文里，最后一行是 `session: <id>`——**先记住这行，它是下一轮的钥匙**（下面第 2 个玩法就靠它）。也可以从代码里直接调：
-
-```json
-{ "task": "把 src/parser.ts 里 parse() 对空输入崩溃的问题修掉，补一个单测", "cwd": "/path/to/repo" }
+```bash
+cd ~/.dsh/profiles
+npm install dsh-claude-delegate
 ```
 
----
-
-## 它是什么，它不做什么
-
-| | |
-|---|---|
-| **是什么** | 一个"外包接口"：你给它一份自包含的活儿，它把 CLI 跑完，把最终文本、`sessionId`、花费、轮次、用到的工具交回来 |
-| **不是** | 不是把 Claude 当作 DSH 的裸模型接入。它驱动的是**完整 Claude Code**（能读写文件、能跑命令、有自己的会话） |
-| **顺手给的** | 长命令实时输出、后台作业、跨轮记忆（resume）、成本上限、结构化输出、自装技能、一块能盯进度的面板 |
-| **不负责的** | 替你定义"什么叫做对"。任务书里的验收标准得你先想清楚 |
-
----
-
-## 三个高频玩法
-
-### 1. 长活不堵对话
-
-加 `run_in_background: true`，工具**立刻**返回 `jobId`，活在后天跑，你现在这轮可以继续干别的：
-
-```json
-{ "task": "把 src/ 全量迁到新 logger API，跑通 npm run build", "run_in_background": true }
-// → { "kind": "background", "jobId": "claude-code-1" }
-```
-
-读进度用 DSH 自带的作业工具（每次只回上次之后的新内容）：
-
-```
-job_output { "jobId": "claude-code-1" }   # 看新输出
-job_list   {}                             # 谁在跑
-job_kill   { "jobId": "claude-code-1" }   # 不要了
-```
-
-跑完 DSH 会推一条完成通知，不用轮询。后台作业同样受 `timeoutMs` 约束，超时按 `failed` 结算（已经产出的输出留着）。这一套依赖 `dsh-tool-jobs`，没装时后台模式会直接报 `background jobs unavailable`。
-
-### 2. 停下改完接着干
-
-第一轮末尾那行 `session: <id>` 就是钥匙，下一轮把它塞进 `resume`：
-
-```json
-// 第二轮：同一个 Claude Code 会话，它记得上一轮干了什么、为什么那么干
-{ "task": "上一步的修复漏了边界情况 X，补上并重跑测试", "resume": "abc-123" }
-```
-
-后台作业也一样能续：结算文本里同样带着 `session: <id>`。
-
-### 3. 两条活一起跑
-
-两条互不相干的活（不同模块、不同仓库）不用排队——同一轮里发两次调用、都开后台，面板里就是两条独立的任务 tab，各自刷各自的输出。想让它自动编排（判要不要 worktree、开分支、派完再集成），装插件时一起带的 `parallel-dev` 技能是干这个的。
-
----
-
-## 控制委派：参数怎么给
-
-参数分五类，按需要给，不给就吃配置里的默认值。
-
-| 想控制 | 参数 |
-|---|---|
-| **干什么** | `task`（必填，写清目标 / 文件 / 约束 / 验收） |
-| **在哪儿干** | `cwd`（**建议每次显式给绝对路径**；不给时不会跟随主会话，而是落到宿主进程的 cwd） |
-| **用谁、怎么干** | `model`、`effort`、`maxTurns`、`permissionMode`、`allowedTools`、`appendSystemPrompt`、`subagents` |
-| **花多少** | `maxBudgetUsd`（美元上限，到点就停）、`timeoutMs`（硬超时）、`thinkingMode` / `maxThinkingTokens` |
-| **怎么交回来** | `outputSchema`（给 JSON Schema 就回结构化结果）、`resume`（续上一轮）、`run_in_background`（转后台） |
-
-结果里给回来的：最终文本、`sessionId`、token 用量、费用、轮次、耗时、用过的工具；给了 `outputSchema` 还会多一个 `structuredOutput`。
-
-> `permissionMode` 默认 `acceptEdits`——**文件编辑自动放行，跑命令仍然会被拒**。要它自己跑构建/测试，得在调用里显式给 `allowedTools`（例如 `["Read","Write","Edit","Bash","Glob","Grep"]`）。这个插件**没有审批弹窗**：没预授权的操作直接失败，不会停下来等人点同意。
-
----
-
-## 配置：写在 profile 里
+随后在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 中确认存在以下接线：
 
 ```yaml
 - insert:
     - id: claude-code
-      name: 'dsh-claude-delegate'
+      name: dsh-claude-delegate
       config:
-        model: sonnet                # sonnet | opus | haiku | 完整 id
+        model: sonnet
+        permissionMode: acceptEdits
+        maxTurns: 100
+        timeoutMs: 7200000
+```
+
+安装后需要重启 DSH。插件自带的接线为**安全默认值**：权限模式为 `acceptEdits`，且不预设代理；仅当本机出网 IP 被判定为数据中心 IP、Anthropic 返回 403 时，才需要自行配置 `proxy`。
+
+### 从源码安装
+
+```bash
+npm install --legacy-peer-deps   # 直接 npm install 会因 dsh-system-prompt → dsh-invariants 的 peer 冲突失败
+npm run build
+cp -R lib/* ~/.dsh/profiles/<profile>/node_modules/dsh-claude-delegate/lib/
+```
+
+## 4. 快速开始
+
+在需要委派的工作目录中调用工具：
+
+```json
+{
+  "task": "修复 src/parser.ts 中 parse() 对空输入崩溃的问题，并补充对应单元测试",
+  "cwd": "/absolute/path/to/repo"
+}
+```
+
+后台执行：
+
+```json
+{
+  "task": "将 src/ 全量迁移到新的 logger API，并确保 npm run build 通过",
+  "cwd": "/absolute/path/to/repo",
+  "run_in_background": true
+}
+```
+
+返回值为 `{ "kind": "background", "jobId": "claude-code-1" }`。随后可使用 DSH 原生作业工具读取增量输出：
+
+```
+job_output  { "jobId": "claude-code-1" }   # 读取上次调用之后的新输出
+job_list    { }                            # 列出当前作业
+job_kill    { "jobId": "claude-code-1" }   # 终止作业
+```
+
+作业完成时 DSH 会推送完成通知，无需轮询。继续上一轮会话：
+
+```json
+{
+  "task": "上一步的修复遗漏了边界情况，请补充并重新运行测试",
+  "resume": "<上一轮结果中的 session id>"
+}
+```
+
+## 5. 工具参数参考
+
+工具名：`claude_code`
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `task` | string | 是 | — | 任务描述。应包含目标、涉及文件、约束条件与验收标准 |
+| `cwd` | string | 否 | 宿主进程工作目录 | 执行目录，**建议始终传入绝对路径** |
+| `model` | string | 否 | 配置值（默认 `sonnet`） | 模型别名或完整模型 ID |
+| `permissionMode` | string | 否 | 配置值（默认 `acceptEdits`） | `default` / `acceptEdits` / `bypassPermissions` / `plan` / `dontAsk` / `auto` |
+| `allowedTools` | string[] | 否 | 配置值 | 允许 Claude Code 使用的内置工具，例如 `["Read","Write","Edit","Bash","Glob","Grep"]` |
+| `maxTurns` | number | 否 | 配置值（默认 `100`） | 最大对话轮次 |
+| `effort` | string | 否 | 配置值（默认 `high`） | 思考强度 |
+| `thinkingMode` | string | 否 | 配置值 | `adaptive` 或 `disabled` |
+| `maxThinkingTokens` | number | 否 | 配置值 | 思考 Token 上限 |
+| `maxBudgetUsd` | number | 否 | 配置值 | 美元成本上限，达到后停止 |
+| `timeoutMs` | number | 否 | 配置值（默认 `7200000`） | 单次执行硬超时 |
+| `appendSystemPrompt` | string | 否 | 配置值 | 追加到系统提示的指令 |
+| `run_in_background` | boolean | 否 | `false` | 是否作为后台作业运行 |
+| `resume` | string | 否 | — | 续跑指定的 Claude Code 会话 ID |
+| `outputSchema` | object | 否 | — | 结构化输出模式（JSON Schema） |
+| `subagents` | object | 否 | 配置值 | 自定义 subagent 定义 |
+| `proxy` | string | 否 | 配置值 | 传给 claude 子进程的代理地址 |
+| `shellChannelOnly` | boolean | 否 | 配置值（默认 `false`） | 设为 `true` 时禁用内置 Bash，所有命令必须经实时通道执行 |
+
+返回内容包含：最终文本、`sessionId`、Token 用量、费用、轮次、耗时与调用过的工具；提供 `outputSchema` 时额外返回 `structuredOutput`。
+
+> **权限说明**：`permissionMode: acceptEdits` 仅自动放行文件编辑，命令执行仍需通过 `allowedTools` 预授权。本插件**未实现审批桥**（`canUseTool`），未授权的操作会直接失败，不会等待人工确认。
+
+## 6. 插件配置参考
+
+在 profile 的 `cordis.patch.yml` 中配置：
+
+```yaml
+- insert:
+    - id: claude-code
+      name: dsh-claude-delegate
+      config:
+        model: sonnet                # sonnet | opus | haiku | 完整模型 ID
         permissionMode: acceptEdits  # default | acceptEdits | bypassPermissions | plan | dontAsk | auto
         maxTurns: 100
         timeoutMs: 600000
-        # cwd: /path/to/repo
+        # cwd: /absolute/path/to/repo
         # maxBudgetUsd: 2
-        # appendSystemPrompt: 提交信息一律用中文；不要动 lib/ 目录。
-        # proxy: http://127.0.0.1:7890      # 出网 IP 被 Anthropic 判成数据中心时用
-        # subagents:                        # Claude Code 内部可被 Agent 工具调用
+        # appendSystemPrompt: 提交信息一律使用中文；不要修改 lib/ 目录。
+        # proxy: http://127.0.0.1:7890
+        # allowDangerouslySkipPermissions: true
+        # subagents:
         #   reviewer:
-        #     description: 复核刚写完的补丁，只报真问题
-        #     prompt: 你是严格的代码复核者，按严重度排序输出。
+        #     description: 复核补丁，仅报告实质问题
+        #     prompt: 你是严格的代码复核者，按严重程度排序输出结论。
         #     tools: [Read, Grep, Glob]
 ```
 
-常用字段（完整表见源码 `Config` schema）：
-
-| 字段 | 默认 | 作用 |
+| 字段 | 默认值 | 说明 |
 |---|---|---|
-| `model` / `effort` | `sonnet` / `high` | 用哪个别名、思考多用力 |
-| `permissionMode` | `acceptEdits` | 权限档位；`bypassPermissions` 需要额外开 `allowDangerouslySkipPermissions` 才生效（有意的保险闸） |
-| `maxTurns` / `timeoutMs` | `100` / `7200000` | 轮次上限、单次硬超时 |
-| `warnTimeoutMs` / `warnIntervalMs` | `3600000` / `1800000` | 跑太久先告警（不中止），以及多久重复一次；设 `0` 关 |
-| `cwd` / `allowedTools` | 宿主 cwd / 未设 | 干活目录、允许的内置工具 |
-| `pathToClaudeCodeExecutable` | 自动探测 | 手动指定 `claude` 可执行文件 |
-| `proxy` | 未设 | 写进 claude 子进程的 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` |
-| `shellChannel` / `shellChannelOnly` / `shellPath` / `shellTimeoutMs` | `true` / `false` / 自动 / `900000` | 实时输出通道（下一节） |
-| `subagents` | 未设 | 自定义 subagent 表 |
+| `model` | `sonnet` | 模型别名或完整 ID |
+| `effort` | `high` | 思考强度 |
+| `permissionMode` | `acceptEdits` | 权限模式 |
+| `allowDangerouslySkipPermissions` | `false` | 显式开关；为 `false` 时 `bypassPermissions` 不生效 |
+| `maxTurns` | `100` | 轮次上限 |
+| `timeoutMs` | `7200000` | 单次硬超时（毫秒） |
+| `warnTimeoutMs` | `3600000` | 超时预警阈值；`0` 表示关闭 |
+| `warnIntervalMs` | `1800000` | 预警重复间隔；`0` 表示关闭 |
+| `cwd` | 未设置 | 默认工作目录 |
+| `allowedTools` | 未设置 | 默认允许的工具集合 |
+| `pathToClaudeCodeExecutable` | 自动探测 | `claude` 可执行文件路径 |
+| `proxy` | 未设置 | 写入子进程的 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` |
+| `subagents` | 未设置 | 自定义 subagent 定义表 |
+| `shellChannel` | `true` | 是否启用长命令实时输出通道 |
+| `shellChannelOnly` | `false` | 是否禁用内置 Bash（仅保留实时通道） |
+| `shellPath` | 自动探测 | bash 可执行文件路径 |
+| `shellTimeoutMs` | `900000` | 实时通道单条命令默认超时（毫秒） |
 
-本来想省事的场景下，`dsh plugin add` 用的就是包内自带的 `cordis.patch.yml`（安全默认：`acceptEdits`、不带代理）。
+## 7. 监控面板
 
----
+DSH 会话顶部「对话 / 轨迹」旁新增 **Claude Code** 标签页，用于观察当前会话内所有后台委派任务。
 
-## 面板：从派出去到收回来
+- **任务列表**：每条后台作业一个标签，颜色指示状态（运行中、完成、失败、已取消）；运行中的任务排在最前，已结束的任务按时间倒序排列。
+- **详情弹窗**：标签上的 `ⓘ` 打开，显示完整任务文本、模型、状态、起止时间、耗时、费用、轮次、Claude Code 会话 ID（可复制后直接用作 `resume`）与失败原因。
+- **过程视图**：助手文本以 Markdown 渲染（标题、粗体、行内代码、代码块、列表、引用、链接，可切换原文/预览）；思考块默认折叠；每次工具调用显示为一张卡片（工具名、参数、结果、运行时长），任务结束时显示汇总行。
+- **实时输出块**：经实时通道执行的命令显示为终端块，包含命令行、逐行输出（stderr 单独着色）与退出码、耗时。
+- **取消**：确认后终止子进程树，作业按 `killed` 结算，模型侧同样收到完成通知。
 
-会话顶部「对话 / 轨迹」旁边会多一个 **Claude Code** 标签页，点开会话体就变成监控面板。它不是日志窗，是"这条活现在到哪了"的一屏：
+实现约定：
 
-- **任务条**：本会话每条后台作业一个 tab。色点即状态——运行中蓝色呼吸、完成绿、失败红、被取消灰；运行中的排在最前，结束的按时间倒序。标题太长会截断，放不下横向滚。
-- **详情弹框**：tab 上的 `ⓘ` 打开，里面是完整任务全文、模型、状态、起止时间、耗时、费用、轮次、Claude 会话 id（点一下复制，直接当 `resume` 用）和失败原因。字段缺就显示 `-`。
-- **主体窗口**：顶部一条统计（jobId / 状态 / 轮次 / 费用 / 耗时），下面是过程——助手文本**按 Markdown 预览**（标题、粗体、行内码、代码块、列表、引用、链接，每块右下角能切「原文 / 预览」；渲染器是手写的零依赖实现，全走 React 文本节点、不用 `innerHTML`，链接只放行 `http(s):` 且带 `noopener`），思考块默认收成一行 `💭`，每次工具调用是一张卡片（工具名着色 + 参数一行，点开展开），结果挂在卡片下（太长折叠），运行中的卡片显示 `⏳ 运行中 <已跑>`，收尾是一条 `✅ 完成 · $0.13 · 12 turns · 3m20s`。贴着底自动滚，你一上滚就暂停并给出「↓ 回到底部」。
-- **命令输出块**：走实时通道的命令（见下一节）在这里显示成终端块——`▶ 实时输出` 头 + 逐行输出（stderr 标红）+ 暗色的 `exit 0 · 12.3s` 收尾。
-- **取消**：按钮在一次确认后真的把子进程树杀掉，任务按 `killed` 结算，**模型那边照样收到完成通知**。
+- 面板按**绝对偏移**读取输出，与模型侧 `job_output` 的游标相互独立，各自翻阅互不影响。
+- 作业记录保存在当前 DSH 进程内，每个会话保留最近 20 条，进程重启后清空；历史结果仍可在对话的工具卡片中查看。
+- 修改插件的客户端部分后**必须重启 DSH**，桌面端不提供硬刷新。
 
-几个实现上的事实，用起来会碰到：
+## 8. 长命令实时输出通道
 
-- 面板读的是**绝对偏移**，和模型侧 `job_output` 的游标各走各的——你在面板里翻输出，不会把模型的字节偷走。
-- 任务记录活在**当前 DSH 进程**里（每会话留最近 20 条），重启就空；想回看历史结果，去对话里的工具卡片。
-- tab 的位置由插件加载顺序决定，一般就在「轨迹」右边。
-- **改了插件的客户端半边必须重启 DSH**：桌面端没有硬刷新。
+### 设计动因
 
----
+Claude Agent SDK 的消息联合中**不包含工具输出帧**：工具执行期间只产生进度心跳（`tool_progress`），执行结束后才返回一次 `tool_result`。CLI 自身持有 Bash 的管道，不向 SDK 转发增量输出。因此，若要让用户看到长时间命令的实时输出，插件必须自行创建执行通道。
 
-## 命令输出为什么能实时
+### 实现方式
 
-这里有个 SDK 层面的硬事实：**Agent SDK 从不把工具的输出转发给你**。它的消息联合里没有"工具输出"这种帧——工具跑的时候只有心跳（`tool_progress`），跑完才给一个 `tool_result`。你在 Claude Code 自己的 TUI 里能看到 Bash 滚动输出，是因为管道握在 CLI 手里，不往外发。
+插件注册一个进程内 MCP Server（名称 `dsh`），对外提供工具 `mcp__dsh__shell`。命令由插件自身 `spawn`（`bash -lc`），输出因此可以先进入插件的事件流，再按需提供给模型。插件的系统提示会提示模型：**预计运行超过 20 秒的命令应通过该通道执行**。
 
-绕不过去，就自己开一条：插件挂了一个**进程内 MCP server**（名字 `dsh`），工具叫 `mcp__dsh__shell`。命令由插件自己 spawn（`bash -lc`），所以每一行都先经过我们的手——逐行进面板，同时按需回给模型。
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `command` | 是 | 待执行命令 |
+| `cwd` | 否 | 执行目录，默认使用委派的工作目录 |
+| `timeoutMs` | 否 | 单条命令超时，默认 15 分钟；超时终止整棵进程树（Windows 使用 `taskkill /T /F`） |
+| `purpose` | 否 | 一句话说明，显示在面板的命令行上 |
 
-| 参数 | 说明 |
+### 行为约束
+
+- 通道输出**仅进入面板，不进入 `job_output`**，避免大量构建日志占用模型上下文；因此无论执行何种命令，**结论与关键输出必须在回复正文中给出**。
+- 输出解码优先使用 UTF-8，出现替换字符时回退到 GBK，以适配中文 Windows 环境。
+- 每次调用均为**独立进程**，`cd`、`export` 等状态不跨调用保留；短命令与需要保持 shell 状态的命令仍应使用内置 Bash。
+- 将 `shellChannelOnly` 设为 `true` 可禁用内置 Bash，使所有命令都经实时通道执行，代价是失去 shell 状态连续性。
+- 未检测到可用 bash 时，工具会明确提示模型改用内置 Bash，不会静默失败。
+
+## 9. 内置技能
+
+插件在运行时注册以下技能（`source: runtime`），因此**无需**向 `~/.dsh/skills/` 放置副本，避免出现两份内容不一致的说明：
+
+| 技能 | 内容 |
 |---|---|
-| `command`（必填） | 要跑的命令 |
-| `cwd` | 在哪儿跑，默认用委派的工作目录 |
-| `timeoutMs` | 本命令的超时，默认 15 分钟；到点**连整棵进程树一起杀**（Windows 走 `taskkill /T /F`） |
-| `purpose` | 一句话说明这条命令在干什么，显示在面板的命令行上 |
+| `claude-code-delegation` | 任务书模板与硬约束、开派前置检查、`outputSchema` 骨架、回传验收流程，以及本插件的参数、后台作业、实时通道、面板与超时机制 |
+| `parallel-dev` | 并行开发编排：任务拆分、worktree 与分支管理、并行分派与结果集成 |
 
-为了让模型真的用它，插件会把规矩注入委派的系统提示：**预计超过 20 秒的命令走 `mcp__dsh__shell`**。其余细节：
+## 10. 安全与合规
 
-- 输出**只进面板，不进 `job_output`**——几千行构建日志不该灌进上下文。所以不管跑了什么命令，结论仍必须写在回复正文里。
-- 编码兜底：整块先按 UTF-8 解，出现替换字符就按 **GBK** 重解（中文 Windows 不会变问号）。
-- 每条命令都是**一次性进程**：`cd` / `export` 不跨调用保留。短命令、需要连续 shell 状态的命令，继续用内置 Bash。想要 100% 都有实时输出，把 `shellChannelOnly` 打开（它会禁用内置 Bash，代价就是失去这个状态）。
-- 找不到 bash 时，工具会直接告诉模型"改用内置 Bash"，不静默失败。
+- 插件通过官方 CLI 与官方 Agent SDK 调用 Claude Code，符合 Anthropic 的认证与订阅要求。
+- 插件**不读取、不转发、不落盘**任何 OAuth 凭据；不存在将 Claude 订阅当作裸模型接入的实现。
+- Claude Code 在本地以当前用户权限执行工具，DSH 的沙箱与权限策略**不作用于**其工具调用。请将 `cwd` 与 `permissionMode` 限制在可信范围内。
+- 插件没有审批交互：未授权的操作直接失败，不会暂停等待人工确认。审核应体现在任务书的验收标准中。
+- **模型来源须如实说明**：插件驱动的是 Claude Code CLI 外壳，其底层模型由本机 `~/.claude/settings.json`（`ANTHROPIC_BASE_URL` 与模型别名映射）决定，**不一定是 Anthropic 的模型**。因此不应将结果表述为「来自 Claude」，准确表述是「以 Claude Code 方式（外壳）运行」。
 
----
+## 11. 运行机制
 
-## 技能：装插件即装
+| 部分 | 入口 | 产物 | 构建方式 |
+|---|---|---|---|
+| 宿主侧 | `src/index.ts`，以及 `tracker.ts`、`remote.ts`、`live-shell.ts`、`delegate-model.ts`、`delegation-skill.ts` | `lib/*.js` 与 `lib/types/**` | `tsc -p tsconfig.json` |
+| 客户端侧 | `src/client/index.ts` | 单文件 `lib/client.js`（CJS，外层为 `window.__ModuleLoader__.load(...)`） | `tsc -p tsconfig.client.json`（仅生成声明）+ `scripts/build-client.mjs`（esbuild） |
 
-插件在运行时注册技能（`source: runtime`），所以**不用**再往 `~/.dsh/skills/` 放副本——放副本反而会变成两份说明书互相打架。
+- 委派执行：宿主侧创建 SDK 会话，将 SDK 消息转写为面板事件（文本、思考块、工具卡片、进度、结果），并把实时输出增量镜像到事件流。
+- 作业管理：后台作业通过 DSH 作业服务登记，插件自有的 tracker 维护每个作业的元数据与输出缓冲；面板行数据由作业服务名册、0.1.x 镜像与插件 tracker 三路合并得到。
+- 客户端侧仅允许 `require` DSH shell 提供的白名单依赖（`react`、`react/jsx-runtime`、`@deepseek-ai/dsh-client-ui-primitives` 等），其余依赖必须打包进产物；构建脚本会对此进行断言。
+- `scripts/assert-artifacts.mjs` 逐个断言产物存在；**新增模块时必须同步更新该清单**，否则遗漏文件不会被发现。
 
-| 技能 | 里面是什么 |
+## 12. 故障排查
+
+| 现象 | 处理方式 |
 |---|---|
-| `claude-code-delegation` | 任务书模板（🔒 硬约束）+ 开派前置检查三条 + `outputSchema` 骨架 + 回传后怎么验收 + 本插件的参数 / 后台作业 / 实时通道 / 面板 / 两级超时 / 什么时候别派 |
-| `parallel-dev` | 并行开发编排：多任务分派、worktree 与分支、事后集成 |
+| `claude executable not found` | 安装 CLI（`npm install -g @anthropic-ai/claude-code`），或通过 `pathToClaudeCodeExecutable` 指定路径 |
+| 实时通道提示找不到 bash | Windows 下安装 Git for Windows，或通过 `shellPath` 指向其 `bash.exe`；不要使用 `WindowsApps\bash.exe`（WSL 占位程序） |
+| `cwd does not exist or is not a directory` | 传入存在的绝对路径；未传时使用宿主进程工作目录 |
+| 认证失败或计费错误 | 先在终端手动执行一次 `claude` 完成登录，并确认订阅状态 |
+| 限流或过载 | 稍后重试，或降低 `effort`、拆分任务 |
+| 返回 403（出网 IP 被判定为数据中心 IP） | 通过 `proxy` 指定本机代理，或为 DSH 进程设置 `HTTPS_PROXY` 后重启 |
+| `bypassPermissions` 未生效 | 设计如此：需同时显式设置 `allowDangerouslySkipPermissions: true`，否则请改用 `acceptEdits` 或 `auto` |
+| 达到 `maxBudgetUsd` | 提高预算上限，或拆分任务 |
+| `resume` 报 `no conversation found` | 该会话已被清理，去掉 `resume` 重新开始 |
+| 后台作业报 `session "[object Object]" has no live agent` | DSH 0.2 之前的兼容问题，0.7.1 起已修复 |
+| 面板任务列表为空 | 空状态会显示 `row sources: roster N · tracker M`，据此判断是作业服务名册还是插件 tracker 未返回数据 |
 
----
+## 13. 常见问题
 
-## 安全与合规
+**是否必须指定 `cwd`？**
+建议始终指定。省略时会使用宿主进程的工作目录，可能加载到与目标项目无关的配置。
 
-- ✅ 走的是官方 CLI 与 Agent SDK，符合 Anthropic 的认证与订阅政策。
-- ❌ 本插件**不是**"把 Claude 当裸模型接进 DSH"——那要求提取 Claude Code 的 OAuth token 直连 `api.anthropic.com`，属于明令禁止、会封号的做法。
-- ⚠️ 权限边界：Claude Code **自己**执行工具，DSH 的沙箱不套在它的调用上。`cwd` 和 `permissionMode` 请收敛在你信任的范围内。
-- 📌 表述要准：插件运行的是 **Claude Code CLI 外壳**，底层模型由本机 `~/.claude/settings.json`（`ANTHROPIC_BASE_URL` 与别名映射）决定，**不一定是 Anthropic 的模型**。所以别说"来自 Claude"，准确说法是"以 Claude Code 方式（外壳）运行"。
+**为什么 `acceptEdits` 下无法执行构建或测试？**
+`acceptEdits` 仅放行文件编辑。需要在调用中通过 `allowedTools` 显式预授权命令执行。
 
----
+**执行过程中会请求确认吗？**
+不会。插件未实现审批桥，未授权的操作直接失败。审核应在任务书的验收标准中完成。
 
-## 排障速查
+**为什么某些长命令在面板中没有实时输出？**
+该命令经内置 Bash 执行，而 SDK 不转发内置 Bash 的输出，面板只能显示运行中状态。将 `shellChannelOnly` 设为 `true` 可强制所有命令经实时通道执行。
 
-| 你看到的 | 怎么办 |
+**重启后任务列表为什么为空？**
+作业记录保存在进程内，每个会话保留最近 20 条。历史结果可在对话的工具卡片中查看。
+
+**可以指定其他模型吗？**
+可以，但最终生效的模型由本机 `~/.claude/settings.json` 的别名映射决定。`model` 参数传入的是别名或完整 ID。
+
+## 14. 派生来源与改动说明
+
+本仓库是衍生项目，上游为 [zhangjunjesse/dsh-claude-code](https://github.com/zhangjunjesse/dsh-claude-code)（其 npm 包仅发布至 0.1.2），本仓库在其 0.6.0 基础上继续开发。为避免与上游重名，**包名与仓库名均改为 `dsh-claude-delegate`**；上游保留在 `upstream` remote，可通过 `git fetch upstream` 获取。
+
+相对上游的主要改动：
+
+| 类别 | 内容 |
 |---|---|
-| `claude executable not found` | 没装 CLI：`npm install -g @anthropic-ai/claude-code`；或把 `pathToClaudeCodeExecutable` 指对 |
-| 变量通道说找不到 bash | Windows 上要 Git Bash：装 Git，或把 `shellPath` 指到 `…\Git\bin\bash.exe`（PATH 上那个 `WindowsApps\bash.exe` 是 WSL 假壳，别用） |
-| `cwd does not exist or is not a directory` | `cwd` 得是存在的绝对路径；不传会落到宿主进程目录 |
-| 认证失败 / 计费报错 | 先在终端手动跑一次 `claude` 完成登录；再查订阅状态 |
-| 限流、过载 | 稍后重试，或降 `effort`、把任务拆小 |
-| 403（出网 IP 是数据中心 IP） | 配 `proxy` 指向本机代理（如 `http://127.0.0.1:7890`），或给 DSH 进程设 `HTTPS_PROXY` 后重启 |
-| `bypassPermissions` 被拒 | 这是有意的：要真用就在配置里显式写 `allowDangerouslySkipPermissions: true`，否则改用 `acceptEdits` / `auto` |
-| 达到 `maxBudgetUsd` | 调高预算，或把任务拆小 |
-| `resume` 报 `no conversation found` | 那个会话已被清理，去掉 `resume` 重开一轮 |
-| 后台作业报 `session "[object Object]" has no live agent` | 0.2 之前的老毛病（owner 传了对象而非 id），0.7.1 起已修 |
-| 面板任务条空了 | 面板空态会写一行 `行来源: roster N · tracker M`——把它发出来就能定位是哪一路断的 |
+| 平台适配 | 适配 DSH 0.2 线（作业 owner 传 session id、结算文本读取 `outcome.result`、客户端从 `ctx.jobs` 读取作业名册、文本增量逐字进入事件流） |
+| 新增能力 | 长命令实时输出通道 `mcp__dsh__shell`；监控面板（任务列表、结构化过程视图、实时输出块、取消操作） |
+| 修复 | `resume` 参数回传与 `session: <id>` 输出；面板切换标签后任务列表丢失的问题 |
+| 结构调整 | 技能改为运行时注册；移除额度与用量相关工具、面板与 RPC |
+| 默认值修正 | 移除上游随包的开发机 `proxy: 127.0.0.1:7897`（本机无该服务，会导致委派必然失败）与 `bypassPermissions` + `allowDangerouslySkipPermissions` 默认值 |
 
----
-
-## FAQ
-
-**一定要配 `cwd` 吗？** 强烈建议配。不配时它落到宿主进程的 cwd，可能连带加载出错误的项目配置。
-
-**`permissionMode: acceptEdits` 为什么跑不了构建？** 因为 `acceptEdits` 只放行文件编辑。要跑命令就在调用里传 `allowedTools` 预授权。
-
-**它会停下来问我吗？** 不会。插件没有审批桥，未授权的操作直接失败。审核请放在任务书里的验收标准上。
-
-**为什么面板看不到某些长命令的滚动输出？** 那条命令没走实时通道（模型用了内置 Bash）。SDK 转发不了内置 Bash 的 stdout，所以退化成一个 `⏳ 运行中` 心跳。想彻底避免，开 `shellChannelOnly`。
-
-**重启后为什么任务条空了？** 设计如此：作业记录是进程内的，每会话留最近 20 条。历史结果在对话的工具卡片里。
-
-**能用别的模型吗？** 能，但那是 `~/.claude/settings.json` 的别名映射说了算（`model` 传的是别名或完整 id）。本机把 `sonnet` 映到 DeepSeek-V4-Flash 之类的第三方端点时，委派拿到的就不是 Anthropic 模型——这属于配置事实，不是插件行为。
-
----
-
-## 自己改插件
+## 15. 开发与发布
 
 ```bash
-npm install --legacy-peer-deps   # 直接 npm install 会因 peer 冲突 ERESOLVE
-npm run build                    # 两个半边都构建，然后断言产物齐全
-npm run typecheck                # node + client 两个 tsconfig 都查
+npm install --legacy-peer-deps
+npm run typecheck     # 宿主侧与客户端侧类型检查
+npm run build         # 构建两侧并断言产物完整
 ```
 
-| 半边 | 入口 | 产物 | 怎么构建 |
-|---|---|---|---|
-| host | `src/index.ts`（+ `tracker.ts` / `remote.ts` / `live-shell.ts` / `delegate-model.ts` / `delegation-skill.ts`） | `lib/*.js` + `lib/types/**` | `tsc -p tsconfig.json` |
-| client | `src/client/index.ts` | `lib/client.js`（单文件 CJS，外层包 `window.__ModuleLoader__.load(...)`） | `tsc -p tsconfig.client.json`（只出 d.ts）+ `scripts/build-client.mjs`（esbuild） |
-
-`scripts/assert-artifacts.mjs` 逐个断言产物存在——**新增模块要同步加进清单**，否则漏文件不会被发现。client bundle 只能 `require` shell 给的白名单（`react`、`react/jsx-runtime`、`@deepseek-ai/dsh-client-ui-primitives` 等），构建脚本会检查；其他依赖必须打进 bundle。
-
-本地装上自己改的版本：
+本地部署与发布：
 
 ```bash
 npm run build
-cp -R lib/* ~/.dsh/profiles/<profile>/node_modules/dsh-claude-delegate/lib/   # 新模块文件也要一起拷
-# 重启 dsh
+cp -R lib/* ~/.dsh/profiles/<profile>/node_modules/dsh-claude-delegate/lib/   # 新增模块文件需一并复制
+# 重启 DSH
+npm publish --access public
 ```
 
-发布：`npm publish`（`publishConfig.access` 已是 public）。发完给 GitHub 仓库打个 **dsh-plugin** topic，就会出现在 github.com/topics/dsh-plugin。
+发布后建议为 GitHub 仓库添加 `dsh-plugin` 主题标签，以便出现在 [github.com/topics/dsh-plugin](https://github.com/topics/dsh-plugin)；如需进入社区插件市场（dshmarket），需向精选列表 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 提交条目。
 
 变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 16. 许可证
+
+[MIT](LICENSE)

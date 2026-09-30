@@ -3,6 +3,10 @@ node_modules/
 .DS_Store
 *.tsbuildinfo
 
+# 本地凭据文件：绝不入库（含 npm 账号、令牌等）
+npm.txt
+.npmrc
+
 # 嵌套的独立仓库（github.com/zhangjunjesse/ds-spec-loop），自行版本管理，
 # 不作为本仓库内容提交——否则会变成一条无 .gitmodules 的破损 gitlink。
 ds-spec-loop/
