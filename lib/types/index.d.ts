@@ -34,8 +34,12 @@ export interface Config {
     allowDangerouslySkipPermissions: boolean;
     shellChannel: boolean;
     shellChannelOnly: boolean;
+    /** Continuity for unnamed calls: off means an unnamed call never joins a line (see session-store.ts). */
+    continueUnnamed: boolean;
     shellPath?: string;
     shellTimeoutMs?: number;
+    autoBackgroundTimeoutMs?: number;
+    bashOutputMaxChars?: number;
     proxy?: string;
     subagents?: Record<string, SubagentConfig>;
 }

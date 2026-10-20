@@ -18,6 +18,8 @@ const artifacts = [
   'lib/delegate-model.js',
   'lib/delegation-skill.js',
   'lib/live-shell.js',
+  'lib/output-file.js',
+  'lib/session-store.js',
   'lib/client.js',
   'lib/types/index.d.ts',
   'lib/types/client/index.d.ts',

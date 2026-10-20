@@ -44,8 +44,28 @@ export type ClaudeEvent =
     run?: string
     phase?: 'start' | 'end'
   }
-  | { type: 'tool_result', tool_use_id: string | null, content: string, isError?: boolean }
-  | { type: 'result', text: string, costUsd?: number, numTurns?: number, durationMs?: number, isError?: boolean }
+  | {
+    type: 'tool_result'
+    tool_use_id: string | null
+    content: string
+    isError?: boolean
+    /** Length of the payload BEFORE the panel's own cap; present only when capped. */
+    totalChars?: number
+    /** Characters the cap dropped from the head (the tail is what survives). */
+    omittedChars?: number
+    /** File the CLI persisted the full output to, when it said so. */
+    outputPath?: string
+  }
+  | {
+    type: 'result'
+    text: string
+    costUsd?: number
+    numTurns?: number
+    durationMs?: number
+    isError?: boolean
+    totalChars?: number
+    omittedChars?: number
+  }
   | { type: 'warning', text: string }
 
 /** One absolute-offset read of a job's event stream. */
@@ -64,8 +84,15 @@ const MAX_EVENT_LINES = 2000
 /** Byte budget of one job's event ring, aligned with the text buffer's intent. */
 const MAX_EVENT_CHARS = 2_000_000
 
-/** Hard cap on a single event line, so one huge block cannot evict the ring. */
-const MAX_EVENT_LINE = 64_000
+/**
+ * Hard cap on a single event line, so one huge block cannot evict the ring.
+ *
+ * Sized well above the panel's own payload cap (`MAX_EVENT_TEXT` in index.ts):
+ * a 30000-character payload can encode to six times that in JSON if it is all
+ * control characters, so anything smaller would shrink — and therefore re-truncate
+ * from the head — exactly the tail the panel went out of its way to keep.
+ */
+const MAX_EVENT_LINE = 200_000
 
 /** Cut one oversized payload in half of the line budget, marking the cut. */
 function cut(text: string): string {
@@ -226,6 +253,14 @@ export interface TrackedRegistration {
   label: string
   /** The resolved `req.model` of this run; absent when the caller had none. */
   model?: string
+  /**
+   * The Claude conversation this run continues, when the caller already knows
+   * it at registration time (a continued or explicitly resumed delegation).
+   * `settle` overwrites it with the session the run actually reported; setting
+   * it up front is what lets the panel fold this run into its conversation's
+   * tab while it is still running instead of opening a new one.
+   */
+  claudeSessionId?: string
   read(fromOffset: number): TrackedRead
   /** The job's own event buffer; a fresh one is created when omitted. */
   events?: EventBuffer
@@ -276,6 +311,34 @@ export function toJobInfo(job: TrackedJob): JobInfo {
 export class JobTracker {
   private readonly jobs = new Map<string, TrackedJob>()
 
+  /**
+   * Persisted-output files one session's panel may read back, keyed by session.
+   *
+   * Filled only from that session's own event stream (the file the CLI named in
+   * a tool result), so the panel can read what the delegated run actually
+   * produced and nothing else — a browser-supplied path it did not receive is
+   * refused. Paths are compared verbatim: the CLI writes absolute paths.
+   */
+  private readonly outputPaths = new Map<string, Set<string>>()
+
+  /** Allow one session's panel to read one persisted output file. */
+  allowOutputPath(sessionId: string, filePath: string): void {
+    let allowed = this.outputPaths.get(sessionId)
+    if (allowed === undefined) {
+      allowed = new Set()
+      this.outputPaths.set(sessionId, allowed)
+    }
+    allowed.add(filePath)
+  }
+
+  /** Resolve an allow-listed output path, refusing anything this session never saw. */
+  requireOutputPath(sessionId: string, filePath: string): string {
+    if (this.outputPaths.get(sessionId)?.has(filePath) !== true) {
+      throw new Error('output file was not offered by this session')
+    }
+    return filePath
+  }
+
   /** Register a job the moment the jobs seam hands back its id. */
   register(registration: TrackedRegistration): TrackedJob {
     const events = registration.events ?? createEventBuffer()
@@ -285,6 +348,7 @@ export class JobTracker {
       task: registration.task,
       label: registration.label,
       ...(registration.model !== undefined ? { model: registration.model } : {}),
+      ...(registration.claudeSessionId !== undefined ? { claudeSessionId: registration.claudeSessionId } : {}),
       status: 'running',
       startedAt: Date.now(),
       read: registration.read,

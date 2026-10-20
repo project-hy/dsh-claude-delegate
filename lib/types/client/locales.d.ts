@@ -57,10 +57,22 @@ export declare const zh: {
     'events.toolError': string;
     'events.toolRunning': string;
     'events.shellOut': string;
+    'events.headOmitted': string;
+    'events.persistedOpen': string;
+    'events.persistedHead': string;
+    'events.persistedEarlier': string;
+    'events.persistedLoading': string;
+    'events.persistedFailed': string;
     'events.result': string;
     'error.prefix': string;
     'select.empty': string;
     'select.sources': string;
+    'group.runs': string;
+    'group.run': string;
+    'prompt.head': string;
+    'register.title': string;
+    'register.empty': string;
+    'register.line': string;
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<keyof typeof zh, string>;

@@ -16,6 +16,8 @@
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
 import { toJobInfo, type ClaudeEvent, type JobInfo, type JobTracker, type TrackedStatus } from './tracker.js'
+import { readOutputWindow } from './output-file.js'
+import { SessionStore, type WorkstreamInfo } from './session-store.js'
 
 /**
  * `claudeCode/listJobs` row. Identical to the tracker's {@link JobInfo} except
@@ -45,13 +47,51 @@ export interface ReadEventsResult {
 /** Cancellation outcome (mirrors the jobs seam's own vocabulary). */
 export type CancelOutcome = 'requested' | 'already-finished'
 
+/** One window of an output file the CLI persisted, as the panel reads it back. */
+export interface ReadOutputFileResult {
+  text: string
+  /** Absolute byte offset this window starts at. */
+  offset: number
+  /** Offset to request when scrolling further back; 0 once at the head. */
+  prevOffset: number
+  /** Size of the whole file in bytes, so the panel can say how much there is. */
+  totalBytes: number
+  /** True when anything exists before this window. */
+  hasMoreBefore: boolean
+}
+
+/**
+ * One row of the workstream register as the panel sees it: the stored fields
+ * plus the same one-line summary the tool result prints (`· name — what it is
+ * about (N runs, last <age>)`), so both surfaces read alike.
+ */
+export interface WorkstreamWire extends WorkstreamInfo {
+  /** Pre-formatted label; relative ages are computed host-side, once. */
+  summary: string
+}
+
 /** `ctx.claudeCode` — the monitor panel's own remote service. */
 export class ClaudeCodeRemote extends TypertRemoteService {
   private tracker!: JobTracker
 
-  constructor(ctx: Context, tracker: JobTracker) {
+  private sessions!: SessionStore
+
+  constructor(ctx: Context, tracker: JobTracker, sessions: SessionStore) {
     super(ctx, 'claudeCode')
     this.tracker = tracker
+    this.sessions = sessions
+  }
+
+  /**
+   * The workstream register: which conversation id belongs to which declared
+   * workstream, what it is about, and when it last ran. Read-only — the plugin
+   * itself writes it when a delegation settles — and deliberately not scoped to
+   * one directory, because seeing another directory's line is how a caller spots
+   * that it is about to start a duplicate.
+   */
+  @Remote
+  async listWorkstreams(): Promise<WorkstreamWire[]> {
+    return this.sessions.lines().map((row) => ({ ...row, summary: SessionStore.describe(row) }))
   }
 
   /**
@@ -96,6 +136,27 @@ export class ClaudeCodeRemote extends TypertRemoteService {
       nextOffset: chunk.nextOffset,
       truncated: chunk.truncated,
       status: job.status,
+    }
+  }
+
+  /**
+   * One window of an output file the CLI persisted for this session's run.
+   *
+   * The path is not free-form: it must have arrived in this session's own event
+   * stream (`tracker.allowOutputPath`), so the panel cannot ask the host to read
+   * an arbitrary file. `fromOffset` is absolute, and a negative one counts back
+   * from the end — the panel loads the tail first and pages backwards.
+   */
+  @Remote
+  async readOutputFile(sessionId: string, filePath: string, fromOffset: number, limit: number): Promise<ReadOutputFileResult> {
+    const allowed = this.tracker.requireOutputPath(sessionId, filePath)
+    const window = await readOutputWindow(allowed, fromOffset, limit)
+    return {
+      text: window.text,
+      offset: window.start,
+      prevOffset: window.prevOffset,
+      totalBytes: window.totalBytes,
+      hasMoreBefore: window.hasMoreBefore,
     }
   }
 

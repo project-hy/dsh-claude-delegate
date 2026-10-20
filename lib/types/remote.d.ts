@@ -16,6 +16,7 @@
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { Context } from '@deepseek-ai/cordis';
 import { type ClaudeEvent, type JobInfo, type JobTracker, type TrackedStatus } from './tracker.js';
+import { SessionStore, type WorkstreamInfo } from './session-store.js';
 /**
  * `claudeCode/listJobs` row. Identical to the tracker's {@link JobInfo} except
  * for `model`, which is always present: the api-gateway refuses to encode an
@@ -40,10 +41,40 @@ export interface ReadEventsResult {
 }
 /** Cancellation outcome (mirrors the jobs seam's own vocabulary). */
 export type CancelOutcome = 'requested' | 'already-finished';
+/** One window of an output file the CLI persisted, as the panel reads it back. */
+export interface ReadOutputFileResult {
+    text: string;
+    /** Absolute byte offset this window starts at. */
+    offset: number;
+    /** Offset to request when scrolling further back; 0 once at the head. */
+    prevOffset: number;
+    /** Size of the whole file in bytes, so the panel can say how much there is. */
+    totalBytes: number;
+    /** True when anything exists before this window. */
+    hasMoreBefore: boolean;
+}
+/**
+ * One row of the workstream register as the panel sees it: the stored fields
+ * plus the same one-line summary the tool result prints (`· name — what it is
+ * about (N runs, last <age>)`), so both surfaces read alike.
+ */
+export interface WorkstreamWire extends WorkstreamInfo {
+    /** Pre-formatted label; relative ages are computed host-side, once. */
+    summary: string;
+}
 /** `ctx.claudeCode` — the monitor panel's own remote service. */
 export declare class ClaudeCodeRemote extends TypertRemoteService {
     private tracker;
-    constructor(ctx: Context, tracker: JobTracker);
+    private sessions;
+    constructor(ctx: Context, tracker: JobTracker, sessions: SessionStore);
+    /**
+     * The workstream register: which conversation id belongs to which declared
+     * workstream, what it is about, and when it last ran. Read-only — the plugin
+     * itself writes it when a delegation settles — and deliberately not scoped to
+     * one directory, because seeing another directory's line is how a caller spots
+     * that it is about to start a duplicate.
+     */
+    listWorkstreams(): Promise<WorkstreamWire[]>;
     /**
      * Every claude-code delegation owned by one session, with the metadata the
      * jobs mirror does not carry (cost, turns, claude session id, final text).
@@ -61,6 +92,15 @@ export declare class ClaudeCodeRemote extends TypertRemoteService {
      * here never costs the model's `job_output` bytes.
      */
     readEvents(sessionId: string, jobId: string, fromOffset: number): Promise<ReadEventsResult>;
+    /**
+     * One window of an output file the CLI persisted for this session's run.
+     *
+     * The path is not free-form: it must have arrived in this session's own event
+     * stream (`tracker.allowOutputPath`), so the panel cannot ask the host to read
+     * an arbitrary file. `fromOffset` is absolute, and a negative one counts back
+     * from the end — the panel loads the tail first and pages backwards.
+     */
+    readOutputFile(sessionId: string, filePath: string, fromOffset: number, limit: number): Promise<ReadOutputFileResult>;
     /**
      * Cancel from the UI. This goes through the plugin's own AbortController, so
      * the job still settles as `killed` and the model still gets its completion

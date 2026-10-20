@@ -19,18 +19,19 @@
  * on every tab switch; the per-session panel state therefore lives in a bounded
  * module-level cache and the view resumes reading where it left off.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ClaudeCodeApi } from './api.js'
-import type { ClaudeEvent, JobInfo, JobStatus, JobView, JobsClient, ViewProps } from './types.js'
+import type { ClaudeEvent, JobInfo, JobStatus, JobView, JobsClient, ViewProps, WorkstreamView } from './types.js'
 import { EventView } from './EventView.js'
 import { OutputView } from './OutputView.js'
 import { JobDetailModal } from './JobDetailModal.js'
 import { formatDuration, statusLabel } from './format.js'
 import { CSS } from './styles.js'
-import { t } from './locales.js'
+import { t, tf } from './locales.js'
 
 /** Stable empty list so a session with no jobs keeps one array identity. */
 const NO_JOBS: readonly JobView[] = []
+const NO_LINES: readonly WorkstreamView[] = []
 
 /** This plugin's own delegations; every row it tracks carries this kind. */
 const JOB_KIND = 'claude-code'
@@ -71,6 +72,8 @@ function trackedRow(job: JobInfo): JobView {
     ...(job.failureDetail !== undefined ? { detail: job.failureDetail } : {}),
     startedAt: job.startedAt,
     ...(job.finishedAt !== undefined ? { finishedAt: job.finishedAt } : {}),
+    // Only our own rows carry a conversation; it is what folds them together.
+    ...(job.claudeSessionId !== undefined ? { claudeSessionId: job.claudeSessionId } : {}),
   }
 }
 
@@ -139,6 +142,42 @@ function ordered(jobs: readonly JobView[]): JobView[] {
   })
 }
 
+/** One Claude conversation: every run that shares a session id, oldest first. */
+interface JobGroup {
+  /** Conversation id when there is one, otherwise the single run's job id. */
+  key: string
+  jobs: JobView[]
+}
+
+/**
+ * Fold one conversation's runs into one tab.
+ *
+ * The host records one job per delegation call, so a continued conversation
+ * arrived as claude-code-2, claude-code-3, … and the strip grew one tab per
+ * call even though the Claude session never changed. Rows without a session id
+ * (the harness's own `subagent` jobs, runs that failed before reporting one)
+ * stay single-run groups.
+ */
+function groupsOf(rows: readonly JobView[]): JobGroup[] {
+  const byKey = new Map<string, JobGroup>()
+  for (const job of rows) {
+    const key = job.claudeSessionId ?? job.id
+    const group = byKey.get(key)
+    if (group === undefined) byKey.set(key, { key, jobs: [job] })
+    else group.jobs.push(job)
+  }
+  for (const group of byKey.values()) {
+    group.jobs.sort((left, right) => left.startedAt - right.startedAt)
+  }
+  return [...byKey.values()]
+}
+
+/** The run a group's tab reports on: the live one, else the newest. */
+function headOf(group: JobGroup): JobView | undefined {
+  const live = group.jobs.filter(isLive)
+  return live[live.length - 1] ?? group.jobs[group.jobs.length - 1]
+}
+
 /** Tab status dot: blue and breathing while live, then a settled colour. */
 function dotClass(status: JobStatus): string {
   switch (status) {
@@ -163,11 +202,11 @@ function clip(label: string): string {
   return flat.length > TAB_LABEL_CHARS ? `${flat.slice(0, TAB_LABEL_CHARS)}…` : flat
 }
 
-/** Pick the job the panel should show when the current choice is gone. */
-function defaultSelection(rows: JobView[]): string | undefined {
-  const running = rows.filter(isLive)
-  if (running.length) return running[running.length - 1]?.id
-  return rows[0]?.id
+/** Pick the conversation the panel should show when the current choice is gone. */
+function defaultSelection(groups: readonly JobGroup[]): string | undefined {
+  const running = groups.filter((group) => group.jobs.some(isLive))
+  if (running.length) return running[running.length - 1]?.key
+  return groups[0]?.key
 }
 
 async function copy(text: string): Promise<boolean> {
@@ -200,6 +239,14 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
     const rows = useMemo(
       () => ordered(mergeRows(native ?? NO_JOBS, mirrored, tracked).filter((job) => PANEL_KINDS.includes(job.kind))),
       [native, mirrored, tracked],
+    )
+
+    // Stable identity matters: the persisted-output reader holds this in a ref so
+    // one load survives re-renders, and a fresh closure each time would restart it.
+    const readFile = useCallback(
+      (filePath: string, fromOffset: number, limit: number) =>
+        api.readOutputFile(sessionId, filePath, fromOffset, limit),
+      [api, sessionId],
     )
 
     // Keeps the 0.2 roster stream open for this session while the panel is up.
@@ -239,10 +286,27 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
       if (rows.length > 0) panel.rows = rows
     }, [rows, panel])
 
+    // One tab per conversation, not per call: every run that continues a Claude
+    // session lands in the tab of that session and accumulates there.
+    const groups = useMemo(() => groupsOf(rows), [rows])
+
+
     // Seeded from the cached choice (tab switch) or the default pick, so the
     // first paint already shows a job instead of the "pick one" placeholder.
-    const [selected, setSelected] = useState<string | undefined>(() => panel.selected ?? defaultSelection(rows))
+    const [selected, setSelected] = useState<string | undefined>(() => panel.selected ?? defaultSelection(groups))
     const [meta, setMeta] = useState<Record<string, JobInfo>>({})
+    // The host's workstream register: which conversation belongs to which named
+    // line, what it is about, how much it has run. Read-only here — the plugin
+    // writes it when a run settles — and the answer to "what is this tab?".
+    const [register, setRegister] = useState<readonly WorkstreamView[]>(NO_LINES)
+    const [registerOpen, setRegisterOpen] = useState(false)
+    // Register lookup by conversation id: a group key IS the Claude session id
+    // whenever the run knew it, so a named line labels its own tab.
+    const lineOf = useMemo(() => {
+      const map = new Map<string, WorkstreamView>()
+      for (const row of register) map.set(row.sessionId, row)
+      return map
+    }, [register])
     const [error, setError] = useState<string | null>(null)
     const [now, setNow] = useState(() => Date.now())
     const [copied, setCopied] = useState<string | null>(null)
@@ -251,27 +315,36 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
     // Module-level output cache mutates in place; this counter republishes it.
     const [revision, setRevision] = useState(0)
     const bumpRef = useRef(() => { setRevision((value) => value + 1) })
+    // The pane is the conversation's scroller once a group holds several runs.
+    const paneRef = useRef<HTMLDivElement | null>(null)
+    // False once the reader scrolls up: new output must not yank the view back.
+    const panePinnedRef = useRef(true)
 
     // Keep the selection valid as jobs appear, settle and age out.
     useEffect(() => {
-      const stillThere = selected !== undefined && rows.some((job) => job.id === selected)
-      const next = stillThere ? selected : defaultSelection(rows)
+      const stillThere = selected !== undefined && groups.some((group) => group.key === selected)
+      const next = stillThere ? selected : defaultSelection(groups)
       if (next !== selected) setSelected(next)
       panel.selected = next
-    }, [rows, selected, panel])
+    }, [groups, selected, panel])
 
-    const current = rows.find((job) => job.id === selected)
-    const currentStatus = current?.status
+    const current = groups.find((group) => group.key === selected)
+    // The conversation's runs, oldest first; the head is the one the tab reports on.
+    const currentJobs: readonly JobView[] = current?.jobs ?? NO_JOBS
+    const currentLine = current === undefined ? undefined : lineOf.get(current.key)
+    const currentJob = current === undefined ? undefined : headOf(current)
+    const currentId = currentJob?.id
+    const currentStatus = currentJob?.status
     // Rows we did not run ourselves (the harness's own `subagent` jobs) have no
     // tracker entry: their output is read through the harness `observe` stream,
     // and our own RPCs would only fail on them.
-    const ours = current === undefined || current.kind === JOB_KIND
-    const observed = (jobs?.state ?? NO_ROSTER)((state) => (selected === undefined ? undefined : state.observed?.[selected]))
+    const ours = currentJob === undefined || currentJob.kind === JOB_KIND
+    const observed = (jobs?.state ?? NO_ROSTER)((state) => (ours || currentId === undefined ? undefined : state.observed?.[currentId]))
 
     useEffect(() => {
-      if (jobs?.observe === undefined || ours || selected === undefined) return undefined
-      return jobs.observe(sessionId, selected)
-    }, [jobs, ours, sessionId, selected])
+      if (jobs?.observe === undefined || ours || currentId === undefined) return undefined
+      return jobs.observe(sessionId, currentId)
+    }, [jobs, ours, sessionId, currentId])
 
     // Re-fetch metadata whenever a job appears or changes lifecycle state.
     const lifecycle = rows.map((job) => `${job.id}:${job.status}`).join(',')
@@ -290,6 +363,13 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
           setError(`${t('error.prefix')}: ${failure instanceof Error ? failure.message : String(failure)}`)
         },
       )
+      // Fetched on the same tick: the register decides what a tab is CALLED, so
+      // it must not lag a settled run by a poll interval. Its own failure is
+      // swallowed — a register is a convenience, never worth a panel error.
+      api.listWorkstreams(abort.signal).then(
+        (lines) => { setRegister(lines) },
+        () => { /* keep the previous register */ },
+      )
       return () => { abort.abort() }
     }, [sessionId, lifecycle])
 
@@ -299,8 +379,8 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
     // stream the panel renders, and the raw text stream kept as a fallback and
     // as the source for "copy output".
     useEffect(() => {
-      if (selected === undefined || !ours) return
-      const jobId = selected
+      if (current === undefined || !ours) return
+      const runIds = currentJobs.map((job) => job.id)
       const abort = new AbortController()
       let timer: ReturnType<typeof setInterval> | undefined
 
@@ -309,7 +389,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
         setError(`${t('error.prefix')}: ${failure instanceof Error ? failure.message : String(failure)}`)
       }
 
-      const pullText = () => {
+      const pullText = (jobId: string) => {
         const state = panel.outputs.get(jobId) ?? { text: '', offset: 0, truncated: false }
         api.readOutput(sessionId, jobId, state.offset, abort.signal).then(
           (chunk) => {
@@ -325,7 +405,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
         )
       }
 
-      const pullEvents = () => {
+      const pullEvents = (jobId: string) => {
         const state = panel.events.get(jobId) ?? { list: [], offset: 0, truncated: false }
         api.readEvents(sessionId, jobId, state.offset, abort.signal).then(
           (chunk) => {
@@ -341,20 +421,45 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
         )
       }
 
+      // Every run of the conversation is pulled, not just the head one: that is
+      // what makes an accumulating tab show its earlier runs as well as the live one.
       const pull = () => {
-        pullEvents()
-        pullText()
+        for (const jobId of runIds) {
+          pullEvents(jobId)
+          pullText(jobId)
+        }
       }
 
       pull()
-      if (currentStatus === 'running' || currentStatus === 'stopping') {
+      if (currentJobs.some(isLive)) {
         timer = setInterval(pull, POLL_MS)
       }
       return () => {
         abort.abort()
         if (timer !== undefined) clearInterval(timer)
       }
-    }, [sessionId, selected, currentStatus, panel, ours])
+    }, [sessionId, current, currentJobs, currentStatus, panel, ours])
+
+    // Is the reader at the bottom of the conversation scroller? Re-armed whenever
+    // the tab changes, so a freshly opened conversation starts pinned.
+    useEffect(() => {
+      const pane = paneRef.current
+      panePinnedRef.current = true
+      if (pane === null) return undefined
+      const onScroll = () => {
+        panePinnedRef.current = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 48
+      }
+      pane.addEventListener('scroll', onScroll, { passive: true })
+      return () => { pane.removeEventListener('scroll', onScroll) }
+    }, [selected])
+
+    // Keep a live conversation pinned to its newest content, the way the main
+    // chat does — but never fight a reader who scrolled up.
+    useEffect(() => {
+      const pane = paneRef.current
+      if (pane === null || !panePinnedRef.current) return
+      pane.scrollTop = pane.scrollHeight
+    }, [revision, currentJobs, currentStatus, selected])
 
     // Tick only while something is live, so an idle panel costs nothing.
     const liveCount = rows.filter(isLive).length
@@ -385,9 +490,46 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
       window.setTimeout(() => { setCopied((value) => (value === token ? null : value)) }, 1500)
     }, [])
 
-    const detail = current ? meta[current.id] : undefined
-    const output = current ? panel.outputs.get(current.id) : undefined
-    const events = current ? panel.events.get(current.id) : undefined
+    // The head run is what the pane header reports on; every run of the group
+    // still gets its own body below, so an accumulated tab shows its history.
+    const detail = currentId === undefined ? undefined : meta[currentId]
+    // "Copy output" copies the whole conversation in run order, not just the head.
+    const copyText = ours
+      ? currentJobs
+          .map((job) => panel.outputs.get(job.id)?.text ?? meta[job.id]?.finalOutput ?? '')
+          .filter((text) => text !== '')
+          .join('\n\n')
+      : (observed?.text ?? '')
+    // A grouped tab's key IS the Claude session; a single-run tab reads it off
+    // the tracker metadata (the host only learns it once the run settles).
+    const copySessionId = current !== undefined && current.key !== currentJob?.id
+      ? current.key
+      : meta[currentId ?? '']?.claudeSessionId
+
+    // One run's body: its structured stream when it has events, else raw text.
+    const renderRun = (job: JobView) => {
+      const runEvents = panel.events.get(job.id)
+      const runOutput = panel.outputs.get(job.id)
+      const runDetail = meta[job.id]
+      if (runEvents !== undefined && runEvents.list.length > 0) {
+        return (
+          <EventView
+            jobId={job.id}
+            events={runEvents.list}
+            truncated={runEvents.truncated}
+            live={isLive(job)}
+            readFile={readFile}
+          />
+        )
+      }
+      return (
+        <OutputView
+          jobId={job.id}
+          text={runOutput?.text ?? (runDetail?.finalOutput ?? '')}
+          truncated={runOutput?.truncated ?? false}
+        />
+      )
+    }
     // `revision` is read so the memo-free render tracks the mutable cache.
     void revision
 
@@ -413,23 +555,56 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
     return (
       <div className={CSS.root} data-conversation-composer-overlay="">
         <div className={CSS.body}>
-          {/* One tab per delegation, single line each; the strip scrolls
-              horizontally rather than wrapping into a second row. */}
+          {/* One tab per Claude conversation, single line each; the strip scrolls
+              horizontally rather than wrapping into a second row. A conversation
+              that ran several times keeps one tab and shows a run count. */}
+          {/* The workstream register. This is what makes "which conversation is
+              this, and what has it been doing?" answerable instead of remembered. */}
+          <div className={CSS.registerBar}>
+            <button
+              type="button"
+              className={CSS.registerToggle}
+              aria-expanded={registerOpen}
+              onClick={() => { setRegisterOpen((open) => !open) }}
+            >
+              {`${registerOpen ? '▾' : '▸'} ${t('register.title')} · ${register.length}`}
+            </button>
+          </div>
+          {registerOpen
+            ? (register.length === 0
+                ? <div className={CSS.registerEmpty}>{t('register.empty')}</div>
+                : (
+                  <div className={CSS.registerList}>
+                    {register.map((row) => <div key={row.key} className={CSS.registerRow}>{row.summary}</div>)}
+                  </div>
+                ))
+            : null}
+
           <div className={CSS.tabs} role="tablist" aria-label={t('list.title')}>
-            {rows.map((job) => {
-              const active = job.id === selected
+            {groups.map((group) => {
+              const head = headOf(group)
+              if (head === undefined) return null
+              const active = group.key === selected
+              const count = group.jobs.length
+              const runs = tf('group.runs', String(count))
+              // A named line labels its own tab; an unnamed run keeps its label.
+              const line = lineOf.get(group.key)
+              const label = line?.name === undefined ? head.label : line.name
               return (
-                <div key={job.id} role="presentation" className={active ? `${CSS.tab} ${CSS.tabActive}` : CSS.tab}>
+                <div key={group.key} role="presentation" className={active ? `${CSS.tab} ${CSS.tabActive}` : CSS.tab}>
                   <button
                     type="button"
                     role="tab"
                     aria-selected={active}
                     className={CSS.tabMain}
-                    title={job.label}
-                    onClick={() => { setSelected(job.id); panel.selected = job.id }}
+                    title={line === undefined
+                      ? (count > 1 ? `${label} · ${runs}` : label)
+                      : `${label} · ${line.summary.replace(/^· /, '')}`}
+                    onClick={() => { setSelected(group.key); panel.selected = group.key }}
                   >
-                    <span className={dotClass(job.status)} />
-                    <span className={CSS.tabLabel}>{clip(job.label)}</span>
+                    <span className={dotClass(head.status)} />
+                    <span className={CSS.tabLabel}>{clip(label)}</span>
+                    {count > 1 ? <span className={CSS.tabCount}>{count}</span> : null}
                   </button>
                   {/* Opening the detail must not also switch tabs. */}
                   <button
@@ -437,7 +612,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
                     className={CSS.tabInfo}
                     title={t('detail.open')}
                     aria-label={t('detail.open')}
-                    onClick={(event) => { event.stopPropagation(); setDetailFor(job.id) }}
+                    onClick={(event) => { event.stopPropagation(); setDetailFor(head.id) }}
                   >
                     ⓘ
                   </button>
@@ -446,7 +621,7 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
             })}
           </div>
 
-          <div className={CSS.pane}>
+          <div ref={paneRef} className={currentJobs.length > 1 ? `${CSS.pane} ${CSS.paneMulti}` : CSS.pane}>
             {current === undefined ? (
               <div className={CSS.empty}>
                 {t('select.empty')}
@@ -459,14 +634,18 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
               <>
                 <div className={CSS.paneHead}>
                   <div className={CSS.stats}>
-                    <span className={CSS.stat}>{t('detail.job')}: <span className={CSS.mono}>{current.id}</span></span>
-                    <span className={CSS.stat}>{statusLabel(current.status)}</span>
+                    {currentLine?.name === undefined
+                      ? null
+                      : <span className={CSS.stat}>{t('register.line')}: {currentLine.name}</span>}
+                    <span className={CSS.stat}>{t('detail.job')}: <span className={CSS.mono}>{currentId ?? '—'}</span></span>
+                    <span className={CSS.stat}>{statusLabel(currentJob?.status ?? 'completed')}</span>
+                    {currentJobs.length > 1 ? <span className={CSS.stat}>{tf('group.runs', String(currentJobs.length))}</span> : null}
                     {detail?.numTurns !== undefined ? <span className={CSS.stat}>{detail.numTurns} {t('stats.turns')}</span> : null}
                     {detail?.costUsd !== undefined ? <span className={CSS.stat}>{t('stats.cost')} ${detail.costUsd.toFixed(4)}</span> : null}
                     <span className={CSS.stat}>
-                      {t('stats.duration')} {formatDuration(isLive(current) ? now - current.startedAt : (current.finishedAt ?? current.startedAt) - current.startedAt)}
+                      {t('stats.duration')} {currentJob === undefined ? '—' : formatDuration(isLive(currentJob) ? now - currentJob.startedAt : (currentJob.finishedAt ?? currentJob.startedAt) - currentJob.startedAt)}
                     </span>
-                    {current.detail !== undefined ? <span className={CSS.stat}>{current.detail}</span> : null}
+                    {currentJob?.detail !== undefined ? <span className={CSS.stat}>{currentJob.detail}</span> : null}
                   </div>
                 </div>
 
@@ -480,35 +659,41 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
                   <>
                     {observed?.gapBefore === true ? <div className={CSS.error}>{t('events.truncated')}</div> : null}
                     {observed?.error !== undefined ? <div className={CSS.error}>{observed.error}</div> : null}
-                    <OutputView jobId={current.id} text={observed?.text ?? ''} truncated={false} />
+                    <OutputView jobId={currentId ?? ''} text={observed?.text ?? ''} truncated={false} />
                   </>
-                ) : events !== undefined && events.list.length > 0 ? (
-                  <EventView
-                    jobId={current.id}
-                    events={events.list}
-                    truncated={events.truncated}
-                    live={isLive(current)}
-                  />
                 ) : (
-                  <OutputView
-                    jobId={current.id}
-                    text={output?.text ?? (detail?.finalOutput ?? '')}
-                    truncated={output?.truncated ?? false}
-                  />
+                  currentJobs.map((job, index) => (
+                    <Fragment key={job.id}>
+                      {currentJobs.length > 1 ? (
+                        <div className={CSS.groupHead}>
+                          {`${tf('group.run', String(index + 1))} · ${statusLabel(job.status)}`}
+                        </div>
+                      ) : null}
+                      {/* What was sent to it in this run, drawn like a user turn of
+                          the main chat — otherwise a continued tab shows replies
+                          with no record of the prompt that produced them. */}
+                      <div className={CSS.userRow} aria-label={t('prompt.head')}>
+                        <div className={CSS.userStack}>
+                          <div className={CSS.bubble}>{meta[job.id]?.task ?? job.label}</div>
+                        </div>
+                      </div>
+                      {renderRun(job)}
+                    </Fragment>
+                  ))
                 )}
 
                 <div className={CSS.actions}>
-                  {isLive(current) ? (
-                    <button type="button" className={`${CSS.button} ${CSS.danger}`} onClick={() => { onCancel(current.id) }}>
+                  {currentJob !== undefined && isLive(currentJob) ? (
+                    <button type="button" className={`${CSS.button} ${CSS.danger}`} onClick={() => { onCancel(currentJob.id) }}>
                       {t('action.cancel')}
                     </button>
                   ) : null}
                   <button
                     type="button"
                     className={CSS.button}
-                    disabled={(output?.text ?? detail?.finalOutput ?? observed?.text ?? '') === ''}
+                    disabled={copyText === ''}
                     onClick={() => {
-                      void copy(output?.text ?? detail?.finalOutput ?? observed?.text ?? '').then((done) => { if (done) flashCopied('output') })
+                      void copy(copyText).then((done) => { if (done) flashCopied('output') })
                     }}
                   >
                     {copied === 'output' ? t('action.copied') : t('action.copyOutput')}
@@ -516,10 +701,10 @@ export function createClaudeCodeView(api: ClaudeCodeApi, jobs?: JobsClient | und
                   <button
                     type="button"
                     className={CSS.button}
-                    disabled={detail?.claudeSessionId === undefined}
+                    disabled={copySessionId === undefined}
                     title={t('detail.session.hint')}
                     onClick={() => {
-                      void copy(detail?.claudeSessionId ?? '').then((done) => { if (done) flashCopied('session') })
+                      void copy(copySessionId ?? '').then((done) => { if (done) flashCopied('session') })
                     }}
                   >
                     {copied === 'session' ? t('action.copied') : t('action.copySession')}

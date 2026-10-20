@@ -19,6 +19,12 @@ export interface JobView {
   detail?: string
   startedAt: number
   finishedAt?: number
+  /**
+   * Claude conversation this run belongs to, when the host knew it up front or
+   * learned it on settlement. Rows sharing one id are one conversation: the
+   * panel shows them as a single accumulating tab, not one tab per call.
+   */
+  claudeSessionId?: string
 }
 
 /** The client sessions snapshot; a missing `jobsBySession` key means "no jobs". */
@@ -133,6 +139,19 @@ export interface ReadOutputResult {
   status: 'running' | 'completed' | 'failed' | 'killed'
 }
 
+/** One window of a persisted output file, from `claudeCode/readOutputFile`. */
+export interface ReadOutputFileResult {
+  text: string
+  /** Absolute byte offset this window starts at. */
+  offset: number
+  /** Offset to request for the window before this one; 0 once at the head. */
+  prevOffset: number
+  /** Size of the whole file in bytes. */
+  totalBytes: number
+  /** True when anything exists before this window. */
+  hasMoreBefore: boolean
+}
+
 /**
  * One structured item of a delegation's message stream (host `ClaudeEvent`).
  *
@@ -151,8 +170,28 @@ export type ClaudeEvent =
     run?: string
     phase?: 'start' | 'end'
   }
-  | { type: 'tool_result', tool_use_id: string | null, content: string, isError?: boolean }
-  | { type: 'result', text: string, costUsd?: number, numTurns?: number, durationMs?: number, isError?: boolean }
+  | {
+    type: 'tool_result'
+    tool_use_id: string | null
+    content: string
+    isError?: boolean
+    /** Length of the payload before the panel cap trimmed it. */
+    totalChars?: number
+    /** Characters the cap dropped from the head. */
+    omittedChars?: number
+    /** Absolute path the CLI persisted the full output to, when it said so. */
+    outputPath?: string
+  }
+  | {
+    type: 'result'
+    text: string
+    costUsd?: number
+    numTurns?: number
+    durationMs?: number
+    isError?: boolean
+    totalChars?: number
+    omittedChars?: number
+  }
   | { type: 'warning', text: string }
 
 /** One incremental event read from `claudeCode/readEvents`. */
@@ -163,3 +202,20 @@ export interface ReadEventsResult {
   status: 'running' | 'completed' | 'failed' | 'killed'
 }
 
+
+/** One row of the host's workstream register (`claudeCode/listWorkstreams`). */
+export interface WorkstreamView {
+  /** Registry key; also the row's React key. */
+  key: string
+  /** Claude Code conversation this line continues. */
+  sessionId: string
+  cwd: string
+  runs: number
+  createdAt: string
+  updatedAt: string
+  /** Pre-formatted one-liner from the host, the same wording the tool result uses. */
+  summary: string
+  name?: string
+  description?: string
+  lastTask?: string
+}

@@ -57,6 +57,12 @@ export type ClaudeEvent = {
     tool_use_id: string | null;
     content: string;
     isError?: boolean;
+    /** Length of the payload BEFORE the panel's own cap; present only when capped. */
+    totalChars?: number;
+    /** Characters the cap dropped from the head (the tail is what survives). */
+    omittedChars?: number;
+    /** File the CLI persisted the full output to, when it said so. */
+    outputPath?: string;
 } | {
     type: 'result';
     text: string;
@@ -64,6 +70,8 @@ export type ClaudeEvent = {
     numTurns?: number;
     durationMs?: number;
     isError?: boolean;
+    totalChars?: number;
+    omittedChars?: number;
 } | {
     type: 'warning';
     text: string;
@@ -142,6 +150,14 @@ export interface TrackedRegistration {
     label: string;
     /** The resolved `req.model` of this run; absent when the caller had none. */
     model?: string;
+    /**
+     * The Claude conversation this run continues, when the caller already knows
+     * it at registration time (a continued or explicitly resumed delegation).
+     * `settle` overwrites it with the session the run actually reported; setting
+     * it up front is what lets the panel fold this run into its conversation's
+     * tab while it is still running instead of opening a new one.
+     */
+    claudeSessionId?: string;
     read(fromOffset: number): TrackedRead;
     /** The job's own event buffer; a fresh one is created when omitted. */
     events?: EventBuffer;
@@ -169,6 +185,19 @@ export declare function toJobInfo(job: TrackedJob): JobInfo;
 /** Process-local registry of this plugin's background delegations. */
 export declare class JobTracker {
     private readonly jobs;
+    /**
+     * Persisted-output files one session's panel may read back, keyed by session.
+     *
+     * Filled only from that session's own event stream (the file the CLI named in
+     * a tool result), so the panel can read what the delegated run actually
+     * produced and nothing else — a browser-supplied path it did not receive is
+     * refused. Paths are compared verbatim: the CLI writes absolute paths.
+     */
+    private readonly outputPaths;
+    /** Allow one session's panel to read one persisted output file. */
+    allowOutputPath(sessionId: string, filePath: string): void;
+    /** Resolve an allow-listed output path, refusing anything this session never saw. */
+    requireOutputPath(sessionId: string, filePath: string): string;
     /** Register a job the moment the jobs seam hands back its id. */
     register(registration: TrackedRegistration): TrackedJob;
     /** Fill in the outcome once the delegation finished, then prune old rows. */

@@ -18,8 +18,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { CSS, toolToneClass } from './styles.js'
 import { Markdown } from './md.js'
-import { t } from './locales.js'
-import type { ClaudeEvent } from './types.js'
+import { t, tf } from './locales.js'
+import { PersistedOutput } from './PersistedOutput.js'
+import type { ClaudeEvent, ReadOutputFileResult } from './types.js'
 
 /** DOM cap: only the newest events stay in the tree. */
 const MAX_RENDER_EVENTS = 1000
@@ -31,12 +32,18 @@ const RESULT_PREVIEW = 800
 const MAX_CONSOLE_LINES = 400
 /** Our own shell tool: its result is the same text the console group streamed. */
 const SHELL_TOOL = 'mcp__dsh__shell'
+/** Tools whose result is a command transcript, so the card reads as a terminal. */
+const TERMINAL_TOOLS = new Set(['Bash', 'BashOutput', 'PowerShell'])
 /** How close to the bottom still counts as "following the tail". */
 const STICKY_SLACK_PX = 24
 
 interface ResultNode {
   content: string
   isError: boolean
+  /** Characters the host cap dropped from the head of this payload, if any. */
+  omittedChars?: number
+  /** File the CLI persisted the full output to, when its result named one. */
+  outputPath?: string
 }
 
 interface ConsoleLine {
@@ -47,7 +54,18 @@ interface ConsoleLine {
 type Node =
   | { kind: 'text', key: string, text: string }
   | { kind: 'thinking', key: string, thinking: string }
-  | { kind: 'tool', key: string, name: string, preview: string, full: string, results: ResultNode[], progress?: number }
+  | {
+    kind: 'tool'
+    key: string
+    name: string
+    preview: string
+    full: string
+    /** Built-in shell tool: render the command as a prompt and the result as output. */
+    terminal: boolean
+    command?: string
+    results: ResultNode[]
+    progress?: number
+  }
   | { kind: 'console', key: string, lines: ConsoleLine[], footer?: string }
   | { kind: 'meta', key: string, text: string }
   | { kind: 'orphanResult', key: string, result: ResultNode }
@@ -62,6 +80,8 @@ export interface EventViewProps {
   jobId: string
   /** True while the job itself still runs; ticks a tool card whose result is pending. */
   live?: boolean
+  /** One window of a CLI-persisted output file, for the 「完整输出」 view. */
+  readFile?: (filePath: string, fromOffset: number, limit: number) => Promise<ReadOutputFileResult>
 }
 
 /** One-line preview plus the pretty-printed full form of a tool's parameters. */
@@ -93,6 +113,19 @@ function shellParams(input: unknown): { preview: string, full: string } {
   if (command === '') return formatted
   const purpose = typeof record['purpose'] === 'string' ? record['purpose'] : ''
   return { preview: purpose === '' ? command : `${purpose} — ${command}`, full: formatted.full }
+}
+
+/**
+ * A built-in Bash / PowerShell call, shown the way a terminal shows it: the prompt
+ * and the command on one line, with the structured parameters one click away.
+ */
+function bashParams(input: unknown): { preview: string, full: string, command?: string } {
+  const formatted = formatInput(input)
+  if (input === null || typeof input !== 'object') return formatted
+  const record = input as Record<string, unknown>
+  const command = typeof record['command'] === 'string' ? record['command'] : ''
+  if (command === '') return formatted
+  return { preview: `$ ${command}`, full: formatted.full, command }
 }
 
 /** `3m20s` / `12s`, matching the detail line the jobs seam prints. */
@@ -140,8 +173,20 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
         break
       }
       case 'tool_use': {
-        const { preview, full } = event.name === SHELL_TOOL ? shellParams(event.input) : formatInput(event.input)
-        nodes.push({ kind: 'tool', key, name: event.name, preview, full, results: [] })
+        const terminal = TERMINAL_TOOLS.has(event.name)
+        const formatted: { preview: string, full: string, command?: string } = terminal
+          ? bashParams(event.input)
+          : event.name === SHELL_TOOL ? shellParams(event.input) : formatInput(event.input)
+        nodes.push({
+          kind: 'tool',
+          key,
+          name: event.name,
+          preview: formatted.preview,
+          full: formatted.full,
+          terminal,
+          ...(formatted.command !== undefined ? { command: formatted.command } : {}),
+          results: [],
+        })
         if (event.id !== undefined) byToolUse.set(event.id, nodes.length - 1)
         break
       }
@@ -199,7 +244,12 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
         // their result, because those never produced a console block.
         if (owner !== undefined && owner.kind === 'tool' && owner.name === SHELL_TOOL
           && event.content.trimStart().startsWith('exit ')) break
-        const result: ResultNode = { content: event.content, isError: event.isError === true }
+        const result: ResultNode = {
+          content: event.content,
+          isError: event.isError === true,
+          ...(event.omittedChars !== undefined && event.omittedChars > 0 ? { omittedChars: event.omittedChars } : {}),
+          ...(event.outputPath !== undefined ? { outputPath: event.outputPath } : {}),
+        }
         if (owner !== undefined && owner.kind === 'tool') owner.results.push(result)
         else nodes.push({ kind: 'orphanResult', key, result })
         break
@@ -218,7 +268,7 @@ function toNodes(events: readonly ClaudeEvent[]): Node[] {
   return nodes
 }
 
-export function EventView({ events, truncated, jobId, live = false }: EventViewProps) {
+export function EventView({ events, truncated, jobId, live = false, readFile }: EventViewProps) {
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const [following, setFollowing] = useState(true)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
@@ -265,21 +315,47 @@ export function EventView({ events, truncated, jobId, live = false }: EventViewP
     })
   }
 
-  /** A result body: collapsed to a preview with an inline expander. */
-  const renderResult = (key: string, result: ResultNode) => {
+  /**
+   * A result body: collapsed to a preview with an inline expander.
+   *
+   * `terminal` renders it as the command's output pane rather than a JSON payload's
+   * value, and a result the CLI said it persisted offers the whole file instead of
+   * the capped tail — that file is the only complete copy of a long command's output.
+   */
+  const renderResult = (key: string, result: ResultNode, terminal = false) => {
     const open = expanded.has(key)
     const long = result.content.length > RESULT_PREVIEW
     const body = open || !long ? result.content : `${result.content.slice(0, RESULT_PREVIEW)}…`
+    const fileKey = `${key}:file`
+    const fileOpen = expanded.has(fileKey)
+    const readable = result.outputPath !== undefined && readFile !== undefined
+    const canExpand = long || readable
+    const bodyClass = terminal ? `${CSS.evToolResultBody} ${CSS.evTerminalBody}` : CSS.evToolResultBody
     return (
       <div key={key} className={CSS.evToolResult}>
         <div className={result.isError ? `${CSS.evToolResultHead} ${CSS.evToolError}` : CSS.evToolResultHead}>
           {result.isError ? t('events.toolError') : t('events.toolResult')}
         </div>
-        <pre className={result.isError ? `${CSS.evToolResultBody} ${CSS.evToolError}` : CSS.evToolResultBody}>{body}</pre>
-        {long ? (
-          <button type="button" className={CSS.evMore} onClick={() => { toggle(key) }}>
-            {open ? t('output.collapse') : t('output.expand')}
-          </button>
+        {result.omittedChars !== undefined ? (
+          <div className={CSS.evToolResultHead}>{tf('events.headOmitted', result.omittedChars)}</div>
+        ) : null}
+        <pre className={result.isError ? `${bodyClass} ${CSS.evToolError}` : bodyClass}>{body}</pre>
+        {canExpand ? (
+          <div className={CSS.evResultActions}>
+            {long ? (
+              <button type="button" className={CSS.evMore} onClick={() => { toggle(key) }}>
+                {open ? t('output.collapse') : t('output.expand')}
+              </button>
+            ) : null}
+            {readable ? (
+              <button type="button" className={CSS.evMore} onClick={() => { toggle(fileKey) }}>
+                {fileOpen ? t('output.collapse') : t('events.persistedOpen')}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {fileOpen && result.outputPath !== undefined && readFile !== undefined ? (
+          <PersistedOutput filePath={result.outputPath} read={readFile} />
         ) : null}
       </div>
     )
@@ -377,7 +453,9 @@ export function EventView({ events, truncated, jobId, live = false }: EventViewP
 
           const paramsKey = `${node.key}:p`
           const open = expanded.has(paramsKey)
-          const long = node.preview.length > PARAM_PREVIEW
+          // A terminal card shows the command itself — the prompt line the CLI would
+          // have printed — so the JSON parameters only appear once asked for.
+          const preview = node.terminal ? node.preview : (node.preview.length > PARAM_PREVIEW ? `${node.preview.slice(0, PARAM_PREVIEW)}…` : node.preview)
           return (
             <div key={node.key} className={CSS.evTool}>
               <button
@@ -388,9 +466,7 @@ export function EventView({ events, truncated, jobId, live = false }: EventViewP
               >
                 <span className={`${CSS.evToolBadge} ${toolToneClass(node.name)}`}>[{node.name}]</span>
                 {open ? null : (
-                  <span className={CSS.evToolParams}>
-                    {long ? `${node.preview.slice(0, PARAM_PREVIEW)}…` : node.preview}
-                  </span>
+                  <span className={node.terminal ? CSS.evTerminalCmd : CSS.evToolParams}>{preview}</span>
                 )}
                 {node.results.length === 0 && (node.progress !== undefined || live) ? (
                   <span className={CSS.evToolParams}>
@@ -399,7 +475,7 @@ export function EventView({ events, truncated, jobId, live = false }: EventViewP
                 ) : null}
               </button>
               {open && node.full !== '' ? <pre className={CSS.evToolParamsFull}>{node.full}</pre> : null}
-              {node.results.map((result, index) => renderResult(`${node.key}:r${index}`, result))}
+              {node.results.map((result, index) => renderResult(`${node.key}:r${index}`, result, node.terminal))}
             </div>
           )
         })}

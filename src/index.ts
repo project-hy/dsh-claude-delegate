@@ -8,6 +8,7 @@ import { existsSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { JobTracker, createEventBuffer, type ClaudeEvent, type EventBuffer, type TrackedSettlement } from './tracker.js'
 import { ClaudeCodeRemote } from './remote.js'
+import { SessionStore, type ResumePlan } from './session-store.js'
 import { DELEGATION_SKILL } from './delegation-skill.js'
 import {
   createLiveShell, LIVE_SHELL_SERVER, LIVE_SHELL_SYSTEM_RULE, LIVE_SHELL_TOOL_ID, type LiveShell,
@@ -25,13 +26,30 @@ export const name = 'claude-code'
 // which bypasses the inject requirement and returns undefined when absent.
 export const inject = ['tools', 'skills']
 
-const CLIENT_APP = 'dsh-claude-delegate/0.8.0'
+const CLIENT_APP = 'dsh-claude-delegate/0.8.1'
+
+/**
+ * Panel-side id counter for foreground delegations.
+ *
+ * Background runs take the harness's own job id; a foreground call has none, so it
+ * gets a plugin-local one to be listed by the monitor panel like any other run.
+ */
+let foregroundJobSeq = 0
 
 /** Cap for the live-output buffers kept per background job. */
 const MAX_LIVE_BUFFER = 500_000
 
-/** Cap for one tool_result / result payload carried on the event stream. */
-const MAX_EVENT_TEXT = 2000
+/**
+ * Cap for one tool_result / result payload carried on the event stream.
+ *
+ * Deliberately larger than a chat reply: the SDK never forwards a tool's stdout
+ * (only `tool_progress` heartbeats), so this stream is the panel's only access to
+ * what a command printed. The CLI's own inline budget is `bashOutputMaxChars`
+ * (30000 by default), and it writes the rest to a file it names in the result, so
+ * this matches that default instead of second-guessing it — and the cap keeps the
+ * TAIL, because that is where a log's verdict and that file pointer sit.
+ */
+const MAX_EVENT_TEXT = 30_000
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'] as const
 const THINKING_MODES = ['adaptive', 'disabled'] as const
@@ -67,8 +85,12 @@ export interface Config {
   allowDangerouslySkipPermissions: boolean
   shellChannel: boolean
   shellChannelOnly: boolean
+  /** Continuity for unnamed calls: off means an unnamed call never joins a line (see session-store.ts). */
+  continueUnnamed: boolean
   shellPath?: string
   shellTimeoutMs?: number
+  autoBackgroundTimeoutMs?: number
+  bashOutputMaxChars?: number
   proxy?: string
   subagents?: Record<string, SubagentConfig>
 }
@@ -111,8 +133,33 @@ export const Config: z<Config> = z.object({
       'the cost of shell state (each command is a fresh process, so cd/export do not carry across calls).',
     )
     .default(false),
+  continueUnnamed: z.boolean()
+    .description(
+      'Opt back into the removed default: an unnamed delegation continues this DSH session\'s own conversation in ' +
+      'the same directory. Off means an unnamed call always starts a NEW conversation and never joins an existing ' +
+      'one — the safe failure, because one directory can hold several workstreams (a deck and a weekly report) and ' +
+      'joining the wrong one hands a task someone else\'s history with no warning. Only turn this on when one ' +
+      'directory really is one workstream.',
+    )
+    .default(false),
   shellPath: z.string().description('bash executable for the live shell channel; auto-detected (CLAUDE_CODE_GIT_BASH_PATH, Git on PATH) when omitted.'),
   shellTimeoutMs: z.number().description('Per-command timeout for the live shell channel (ms); on expiry the whole process tree is killed.').default(900000),
+  autoBackgroundTimeoutMs: z.number()
+    .description(
+      'Injected as CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS: a command still running after this many ms is moved to ' +
+      'the background by Claude Code itself, which persists its output to a file the panel can read back in full. ' +
+      'Default 0 leaves the CLI default alone. This DOES change model behaviour — the model then polls TaskOutput ' +
+      'for the result instead of receiving it inline — so it stays off unless you ask for it.',
+    )
+    .default(0),
+  bashOutputMaxChars: z.number()
+    .description(
+      'Passed to Claude Code as the `bashOutputMaxChars` setting (via --settings): how many characters of a command\'s ' +
+      'output the DELEGATED MODEL receives inline. The CLI default is 30000 and values clamp to 4000-128000; output ' +
+      'past it is written to a file and named in the result. The panel reads that file, so raising this spends the ' +
+      'delegated model\'s context, not the panel\'s. Default 0 leaves the CLI default alone.',
+    )
+    .default(0),
   allowDangerouslySkipPermissions: z.boolean()
     .description('Deliberate safety switch required before permissionMode bypassPermissions is accepted.')
     .default(false),
@@ -168,15 +215,35 @@ function currentMainSelection(ctx: Context, agent: unknown): MainSelection {
 }
 
 /**
- * The CALLING session's working directory (session meta, else creation-time
- * options). Used as the default delegation cwd — before this, an omitted cwd
- * fell through to process.cwd(), i.e. the DSH install directory, which is
- * almost never where the user's files are.
+ * The CALLING session's working directory. On DSH 0.2.x the live value is
+ * `agent.session.header.cwd` — the same field the bundled tools read
+ * (dsh-tool-fs, dsh-tool-bash, dsh-tools all use `exec.agent?.session.header.cwd`).
+ * The older `session.meta.cwd` / creation-time `options.cwd` lookups stay as
+ * fallbacks. Before this, an omitted cwd fell through to process.cwd(), i.e. the
+ * desktop profile directory, which is almost never where the user's files are.
  */
 function sessionCwd(agent: unknown): string | undefined {
-  const a = agent as { session?: { meta?: { cwd?: string } }; options?: { cwd?: string } } | undefined
-  const cwd = a?.session?.meta?.cwd ?? a?.options?.cwd
+  const a = agent as
+    | {
+        session?: { header?: { cwd?: string }; meta?: { cwd?: string } }
+        options?: { cwd?: string }
+      }
+    | undefined
+  const cwd = a?.session?.header?.cwd ?? a?.session?.meta?.cwd ?? a?.options?.cwd
   return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+}
+
+/**
+ * The CALLING session's id — the namespace automatic continuation remembers under.
+ * This is the same value the jobs seam takes as an owner (it resolves it through
+ * `agents.get(id)`), so a job and its resume key always agree on who "this task" is.
+ */
+function sessionOwnerId(agent: unknown): string | undefined {
+  const a = agent as { id?: string; session?: { id?: string } } | undefined
+  // `agent.session.id` is the live form on DSH 0.2.x (see dsh-agent's own guard);
+  // `agent.id` is kept as the fallback.
+  const id = a?.session?.id ?? a?.id
+  return typeof id === 'string' && id !== '' ? id : undefined
 }
 
 const PARALLEL_DEV_SKILL: SkillRegistration = {
@@ -280,6 +347,15 @@ function preflight(opts: {
   }
 }
 
+/**
+ * A resume whose conversation is gone (cleaned up, or a wiped `~/.claude`).
+ *
+ * Used twice on purpose: to explain the failure to the caller, and to let an
+ * AUTOMATIC continuation fall back to a fresh conversation. A continuation the
+ * caller never asked for by hand must not turn into a failed task.
+ */
+const RESUME_GONE = /no conversation found|could not find session|session .{0,40}not found|failed to resume|resume.{0,40}(failed|not found)/i
+
 const ERROR_HINTS: { match: RegExp, hint: string }[] = [
   {
     match: /error_max_budget_usd|max_budget|budget_exhausted/i,
@@ -306,7 +382,7 @@ const ERROR_HINTS: { match: RegExp, hint: string }[] = [
     hint: 'model 参数无效 — 使用 sonnet / opus / haiku 或一个有效的完整模型 id (invalid model)',
   },
   {
-    match: /no conversation found|could not find session|session .{0,40}not found|failed to resume|resume.{0,40}(failed|not found)/i,
+    match: RESUME_GONE,
     hint: 'resume 的会话不存在或已被清理 — 去掉 resume 重新发起一次任务 (resume session gone; retry without resume)',
   },
   {
@@ -331,7 +407,7 @@ function describeFailure(raw: string): string {
  */
 function sessionLine(sessionId: unknown): string {
   return typeof sessionId === 'string' && sessionId !== ''
-    ? `\nsession: ${sessionId} — pass it back as \`resume\` to continue this delegation`
+    ? `\nsession: ${sessionId} — this conversation is remembered for the task; pass it back as \`resume\` to pin it`
     : ''
 }
 
@@ -371,9 +447,61 @@ function safeJson(value: unknown): string {
   }
 }
 
-/** Cap one event payload, marking the cut so the panel can say so. */
-function capEventText(text: string): string {
-  return text.length > MAX_EVENT_TEXT ? `${text.slice(0, MAX_EVENT_TEXT)}…[truncated]` : text
+/** One payload after the panel cap: what survived, and what the cap dropped. */
+interface CappedText {
+  text: string
+  /** Length before the cap. */
+  totalChars: number
+  /** Characters dropped from the head; 0 when nothing was dropped. */
+  omittedChars: number
+}
+
+/**
+ * Cap one event payload, keeping the TAIL.
+ *
+ * A head-keeping cut is the wrong end here twice over: a log or a test run states
+ * its verdict on the last line, and the CLI has already truncated the head itself
+ * (it appends `Full output saved to: <path>` at the end, which is the pointer the
+ * panel needs to fetch the rest). The embedded marker keeps that fact inside the
+ * text, so a copied payload still says what happened.
+ */
+function capTailText(text: string): CappedText {
+  if (text.length <= MAX_EVENT_TEXT) return { text, totalChars: text.length, omittedChars: 0 }
+  const omitted = text.length - MAX_EVENT_TEXT
+  return {
+    text: `…[omitted ${omitted} chars from the head]\n${text.slice(omitted)}`,
+    totalChars: text.length,
+    omittedChars: omitted,
+  }
+}
+
+/**
+ * `Full output saved to: <path>` — how the CLI points at output it could not hand
+ * over inline (its `bashOutputMaxChars` budget, or a background task's file). On a
+ * resumed session the same sentence arrives wrapped in parentheses.
+ */
+const PERSISTED_OUTPUT = /Full output saved to:\s*([^\r\n]+?)\s*$/gm
+
+/** Strip the quoting and the closing bracket a `Full output saved to:` line adds. */
+function cleanPath(raw: string): string {
+  let path = raw.trim().replace(/^["'`]/, '').replace(/["'`]$/, '')
+  if (path.endsWith(')') && !path.includes('(')) path = path.slice(0, -1).trim()
+  return path
+}
+
+/**
+ * Paths, in order of appearance, that the CLI said it persisted output to.
+ *
+ * Only absolute paths survive: a relative one would be resolved against this
+ * process's cwd rather than the directory the CLI wrote it in.
+ */
+function persistedOutputPaths(text: string): string[] {
+  const paths: string[] = []
+  for (const match of text.matchAll(PERSISTED_OUTPUT)) {
+    const path = cleanPath(match[1] ?? '')
+    if (/^(?:[A-Za-z]:[\\/]|\/)/.test(path)) paths.push(path)
+  }
+  return paths
 }
 
 /** Keep a tool_use input only when it survives a JSON round trip. */
@@ -431,6 +559,10 @@ interface RunRequest {
   shellChannelOnly: boolean
   shellPath?: string
   shellTimeoutMs?: number
+  /** CLI auto-background threshold in ms; 0/undefined leaves the CLI default alone. */
+  autoBackgroundTimeoutMs?: number
+  /** CLI `bashOutputMaxChars` setting; 0/undefined leaves the CLI default alone. */
+  bashOutputMaxChars?: number
 }
 
 interface RunOutcome {
@@ -451,6 +583,27 @@ function buildQueryOptions(req: RunRequest, abort: AbortController, shell?: Live
   // delegated session is headless and cannot answer one.
   const allowed = req.allowedTools === undefined ? [] : [...req.allowedTools]
   if (shell !== undefined && !allowed.includes(LIVE_SHELL_TOOL_ID)) allowed.push(LIVE_SHELL_TOOL_ID)
+  // Typed as a plain record on purpose: spreading `process.env` (an index-signature
+  // type) into an object literal would otherwise leave the literal with only the
+  // keys written here, and every assignment below would fail to typecheck.
+  const env: Record<string, string> = {}
+  for (const [name, value] of Object.entries(process.env)) {
+    if (typeof value === 'string') env[name] = value
+  }
+  env.CLAUDE_AGENT_SDK_CLIENT_APP = CLIENT_APP
+  if (req.proxy) {
+    env.HTTPS_PROXY = req.proxy
+    env.HTTP_PROXY = req.proxy
+    env.ALL_PROXY = req.proxy
+    env.NO_PROXY = process.env.NO_PROXY ?? 'localhost,127.0.0.1'
+  }
+  // The CLI reads this threshold from the environment (it is not a settings key):
+  // past it, a still-running command is moved to the background and its output is
+  // persisted to a file. That file is the one the panel reads back in full, so this
+  // knob is what makes "see the whole output" possible for very long commands.
+  if (typeof req.autoBackgroundTimeoutMs === 'number' && req.autoBackgroundTimeoutMs > 0) {
+    env.CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS = String(Math.floor(req.autoBackgroundTimeoutMs))
+  }
   const options: Options = {
     cwd: req.cwd,
     model: req.model,
@@ -462,16 +615,7 @@ function buildQueryOptions(req: RunRequest, abort: AbortController, shell?: Live
     effort: req.effort as Options['effort'],
     abortController: abort,
     includePartialMessages: true,
-    env: {
-      ...process.env,
-      CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
-      ...(req.proxy ? {
-        HTTPS_PROXY: req.proxy,
-        HTTP_PROXY: req.proxy,
-        ALL_PROXY: req.proxy,
-        NO_PROXY: process.env.NO_PROXY ?? 'localhost,127.0.0.1',
-      } : {}),
-    },
+    env,
   }
   if (req.allowDangerouslySkipPermissions) options.allowDangerouslySkipPermissions = true
   if (req.thinkingMode) options.thinking = { type: req.thinkingMode }
@@ -490,6 +634,16 @@ function buildQueryOptions(req: RunRequest, abort: AbortController, shell?: Live
     options.systemPrompt = { type: 'preset', preset: 'claude_code', append: appended.join('\n\n') }
   }
   if (req.agents) options.agents = req.agents
+  // `bashOutputMaxChars` has no environment variable — it is a settings key, and
+  // the SDK hands `settings` to the CLI as `--settings <json>`, which the CLI
+  // loads as ADDITIONAL settings on top of the user's own file (where the relay
+  // endpoint lives), so only this one key is overridden. The CLI clamps to
+  // 4000-128000 by itself; the clamp here keeps an accidental small number from
+  // asking for a one-character budget.
+  if (typeof req.bashOutputMaxChars === 'number' && req.bashOutputMaxChars > 0) {
+    const wanted = Math.max(4000, Math.min(128_000, Math.floor(req.bashOutputMaxChars)))
+    options.settings = JSON.stringify({ bashOutputMaxChars: wanted })
+  }
   if (req.outputSchema) options.outputFormat = { type: 'json_schema', schema: req.outputSchema }
   return options
 }
@@ -608,10 +762,17 @@ async function runClaude(
         if (raw.isReplay !== true && Array.isArray(content)) {
           for (const block of content as any[]) {
             if (block?.type !== 'tool_result') continue
+            const full = toResultText(block.content)
+            const capped = capTailText(full)
+            const persisted = persistedOutputPaths(full)
             onEvent?.({
               type: 'tool_result',
               tool_use_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : null,
-              content: capEventText(toResultText(block.content)),
+              content: capped.text,
+              ...(capped.omittedChars > 0
+                ? { totalChars: capped.totalChars, omittedChars: capped.omittedChars }
+                : {}),
+              ...(persisted.length > 0 ? { outputPath: persisted[persisted.length - 1] } : {}),
               ...(block.is_error === true ? { isError: true } : {}),
             })
           }
@@ -659,12 +820,16 @@ async function runClaude(
           failure = text ? `${msg.subtype}: ${text}` : msg.subtype
           resultText = failure
         }
+        const cappedResult = capTailText(resultText)
         onEvent?.({
           type: 'result',
-          text: capEventText(resultText),
+          text: cappedResult.text,
           costUsd,
           numTurns,
           durationMs,
+          ...(cappedResult.omittedChars > 0
+            ? { totalChars: cappedResult.totalChars, omittedChars: cappedResult.omittedChars }
+            : {}),
           ...(msg.subtype === 'success' ? {} : { isError: true }),
         })
       }
@@ -702,6 +867,43 @@ async function runClaude(
     durationMs,
     numTurns,
     structuredOutput,
+  }
+}
+
+/**
+ * Run one delegation under a resume plan.
+ *
+ * Everything here is about the seam around `runClaude`: a conversation this run
+ * continued is written back so the NEXT run finds it (that write-back is the whole
+ * feature — the CLI cannot remember across processes), and a remembered
+ * conversation that no longer exists is retried once as a fresh one.
+ */
+async function runWithSession(
+  req: RunRequest,
+  abort: AbortController,
+  sessions: SessionStore,
+  plan: ResumePlan,
+  onDelta?: (text: string) => void,
+  onEvent?: (event: ClaudeEvent) => void,
+): Promise<RunOutcome> {
+  try {
+    const outcome = await runClaude(req, abort, onDelta, onEvent)
+    sessions.remember(plan.key, outcome.sessionId, req.cwd, {
+      ...(plan.name === undefined ? {} : { name: plan.name }),
+      task: req.task,
+    })
+    return outcome
+  } catch (err) {
+    if (plan.mode !== 'continued' || !RESUME_GONE.test(errorText(err))) throw err
+    req.resume = undefined
+    const outcome = await runClaude(req, abort, onDelta, onEvent)
+    plan.mode = 'new'
+    plan.note = '[fresh] 上次的会话已不存在（过期或被清理），这次自动新开了一个'
+    sessions.remember(plan.key, outcome.sessionId, req.cwd, {
+      ...(plan.name === undefined ? {} : { name: plan.name }),
+      task: req.task,
+    })
+    return outcome
   }
 }
 
@@ -773,6 +975,8 @@ function startBackgroundJob(
   req: RunRequest,
   ownerSessionId: string | undefined,
   tracker: JobTracker,
+  sessions: SessionStore,
+  plan: ResumePlan,
 ): string {
   const timeoutMs = req.timeoutMs
   const warnTimeoutMs = req.warnTimeoutMs
@@ -821,7 +1025,15 @@ function startBackgroundJob(
         }
       }
 
-      const onEvent = (event: ClaudeEvent) => { events.append(event) }
+      const onEvent = (event: ClaudeEvent) => {
+        events.append(event)
+        // The CLI persists output it could not hand over inline and names the file
+        // in the result. Registering that path here — from the run's own stream — is
+        // what later lets THIS session's panel read the file back, and nothing else.
+        if (event.type === 'tool_result' && event.outputPath !== undefined && ownerSessionId !== undefined) {
+          tracker.allowOutputPath(ownerSessionId, event.outputPath)
+        }
+      }
 
       const cancel = (fromUi: boolean) => {
         if (settled || cancelled) return false
@@ -834,13 +1046,16 @@ function startBackgroundJob(
 
       const done: Promise<JobOutcome> = (async () => {
         try {
-          const outcome = await runClaude(req, abort, onDelta, onEvent)
+          const outcome = await runWithSession(req, abort, sessions, plan, onDelta, onEvent)
           // Resume needs the session handle, and a background job is read back
           // through the seam ring only — so it is appended here instead of being
           // left in the tracker for the panel alone.
           if (outcome.sessionId !== '' && handle?.append !== undefined) {
-            handle.append(`\n[session] ${outcome.sessionId} — pass it back as \`resume\` to continue\n`)
+            handle.append(`\n[session] ${outcome.sessionId} — remembered for this task; pass it back as \`resume\` to pin it\n`)
           }
+          // Whether this run continued a conversation, started one, or was forced
+          // to start one — the caller reads it here, the same way it reads the id.
+          if (plan.note !== '' && handle?.append !== undefined) handle.append(`\n${plan.note}\n`)
           const cost = typeof outcome.costUsd === 'number' ? `$${outcome.costUsd.toFixed(2)}` : '$0.00'
           const mins = Math.floor(outcome.durationMs / 60000)
           const secs = Math.floor((outcome.durationMs % 60000) / 1000)
@@ -883,6 +1098,8 @@ function startBackgroundJob(
         } finally {
           settled = true
           if (timer) clearTimeout(timer)
+          // The key stops being busy only once the run is really over.
+          sessions.end(plan.key)
         }
       })()
 
@@ -938,6 +1155,9 @@ function startBackgroundJob(
       task: req.task,
       label,
       ...(req.model !== undefined ? { model: req.model } : {}),
+      // Known up front for a continued run, so the panel folds it into that
+      // conversation's tab while it runs; `settle` refines it to what ran.
+      ...(req.resume !== undefined ? { claudeSessionId: req.resume } : {}),
       read: resolved.read,
       events: resolved.events,
       cancelFromUi: resolved.cancelFromUi,
@@ -959,7 +1179,10 @@ export function apply(ctx: Context, config: Config) {
   // monitor panel (client half) reads it through. Both are process-local and go
   // away with the plugin's fiber.
   const tracker = new JobTracker()
-  new ClaudeCodeRemote(ctx, tracker)
+  // Which Claude Code conversation each task is on. Process-local tracker, but
+  // this mapping is on disk on purpose: continuity must survive a DSH restart.
+  const sessions = new SessionStore()
+  new ClaudeCodeRemote(ctx, tracker, sessions)
 
 
   ctx.tools.register(defineTool({
@@ -968,8 +1191,15 @@ export function apply(ctx: Context, config: Config) {
       "Delegate one self-contained coding task to your local Claude Code (running on your Claude subscription) " +
       "and return its final result text. Use it for a well-scoped subtask that benefits from Claude Code's own " +
       "agent loop and tools; give it everything it needs (goal, files, constraints) in the task string. " +
-      "To continue a previous delegation with its remembered context, pass the sessionId you received earlier " +
-      "as resume. Override the Claude model (model) and thinking effort (effort: low/medium/high/xhigh/max) per call. " +
+      "Send one task per call. For a follow-up on the same task (next step, adjust the requirement, fix what it " +
+      "just wrote, question its own conclusion) pass no resume and no fresh: consecutive delegations from the same " +
+      "session in the same directory continue one Claude Code conversation, so it already remembers the previous " +
+      "work. Pass fresh: true only when switching topic or when you want a clean second opinion, and " +
+      "ALWAYS pass conversation: <name> to state which workstream the task belongs to — one name per workstream, " +
+      "reused on every call of it, because one directory usually holds several (a deck and a weekly report). " +
+      "A call without it does NOT join anything: it starts a new conversation and its result lists the " +
+      "workstreams already registered for that directory, so the next call can reuse one of those exact names. " +
+      "Override the Claude model (model) and thinking effort (effort: low/medium/high/xhigh/max) per call. " +
       "For long tasks pass run_in_background: true — the call returns a jobId immediately and you stream its live " +
       "output with job_output, cancel with job_kill, and get a notification when it finishes. " +
       "This is a slow, expensive call; prefer it only when the work is genuinely self-contained.",
@@ -994,7 +1224,15 @@ export function apply(ctx: Context, config: Config) {
       },
       resume: {
         type: 'string',
-        description: 'sessionId returned by an earlier claude_code call; resume that Claude Code session so it remembers its previous work. Omit for a fresh session.',
+        description: 'Force a specific Claude Code session id. Rarely needed: the same task in the same directory continues its previous conversation automatically. Omit to accept that automatic choice.',
+      },
+      fresh: {
+        type: 'boolean',
+        description: 'Start a brand-new Claude Code conversation even though this task remembers one. Use it when switching topic, or when the carried-over history would only cost tokens.',
+      },
+      conversation: {
+        type: 'string',
+        description: 'Which workstream this task belongs to (e.g. "周报", "ppt", "api-refactor"). The same name in the same directory continues one Claude Code conversation; the first call registers the name together with this task as its description. Omit it only when you deliberately want a fresh conversation — an unnamed call never joins an existing line and returns the registry of names already used in that directory.',
       },
       effort: {
         type: 'string',
@@ -1054,7 +1292,8 @@ export function apply(ctx: Context, config: Config) {
         properties: {
           ok: { type: 'boolean', description: 'True when the foreground delegation completed successfully.' },
           output: { type: 'string', description: 'Final result text from Claude Code.' },
-          sessionId: { type: 'string', description: 'Claude Code session id; pass it back as resume to continue.' },
+          sessionId: { type: 'string', description: 'Claude Code session id; pass it back as resume to pin this conversation.' },
+          resumeNote: { type: 'string', description: 'Which conversation this run continued or started, when that is not obvious.' },
           costUsd: { type: 'number', description: 'Estimated cost of this delegation in USD.' },
           inputTokens: { type: 'integer', description: 'Input tokens used by the main agent loop.' },
           outputTokens: { type: 'integer', description: 'Output tokens used by the main agent loop.' },
@@ -1082,7 +1321,8 @@ export function apply(ctx: Context, config: Config) {
         if (value.structuredOutput !== undefined) {
           text += `\n\nstructured output:\n${JSON.stringify(value.structuredOutput, null, 2)}`
         }
-        return [{ type: 'text', text: `${text}\n\n(${stats})${sessionLine(value.sessionId)}` }]
+        const note = typeof value.resumeNote === 'string' && value.resumeNote !== '' ? `\n${value.resumeNote}` : ''
+        return [{ type: 'text', text: `${text}\n\n(${stats})${sessionLine(value.sessionId)}${note}` }]
       },
     },
     timeoutMs: config.timeoutMs,
@@ -1118,22 +1358,93 @@ export function apply(ctx: Context, config: Config) {
         shellChannelOnly: args.shellChannelOnly ?? config.shellChannelOnly === true,
         shellPath: config.shellPath,
         shellTimeoutMs: config.shellTimeoutMs,
+        autoBackgroundTimeoutMs: config.autoBackgroundTimeoutMs,
+        bashOutputMaxChars: config.bashOutputMaxChars,
       }
 
       preflight(req)
 
+      // Session continuity, keyed by the workstream the caller declares: the same
+      // `conversation: <name>` in the same directory continues the conversation that
+      // line used, and the register in session-store.ts keeps name, description and
+      // session id on disk. An explicit `resume` always wins, `fresh: true` opts out,
+      // and an UNNAMED call starts a new conversation (returning the register for its
+      // directory) instead of silently joining a line it cannot identify.
+      const owner = sessionOwnerId(exec.agent)
+      const plan = sessions.plan({
+        cwd: req.cwd,
+        ...(owner !== undefined ? { owner } : {}),
+        ...(args.resume !== undefined ? { explicit: args.resume } : {}),
+        ...(args.fresh === true ? { fresh: true } : {}),
+        ...(args.conversation !== undefined ? { conversation: args.conversation } : {}),
+        continueUnnamed: config.continueUnnamed === true,
+      })
+      if (plan.resume !== undefined) req.resume = plan.resume
+
       if (args.run_in_background) {
         const jobs = ctx.get('jobs')
         if (!jobs) throw new Error('background jobs unavailable: load @deepseek-ai/dsh-tool-jobs')
-        const jobId = startBackgroundJob(jobs, req, (exec.agent as { id?: string } | undefined)?.id, tracker)
-        return { kind: 'background' as const, jobId }
+        // Marked busy before the job starts: a second delegation for the same task
+        // must not open the same conversation while this one is still writing it.
+        sessions.begin(plan.key)
+        try {
+          const jobId = startBackgroundJob(jobs, req, owner, tracker, sessions, plan)
+          return { kind: 'background' as const, jobId }
+        } catch (err) {
+          sessions.end(plan.key)
+          throw err
+        }
       }
 
       const abort = new AbortController()
       const onAbort = () => abort.abort()
       exec.signal.addEventListener('abort', onAbort, { once: true })
+      // Foreground delegations get a panel row too. They have no harness job id, so
+      // they carry a plugin-local one and settle the moment the call returns —
+      // otherwise the panel would list only `run_in_background` runs and every
+      // ordinary delegation would leave no trace at all.
+      const jobId = `foreground-${++foregroundJobSeq}`
+      const events = createEventBuffer()
+      const full = createBuffer()
+      const onDelta = (text: string) => {
+        full.append(text)
+      }
+      const onEvent = (event: ClaudeEvent) => {
+        events.append(event)
+        // Same rule as the background path: only a path this run's own stream named
+        // becomes readable by this session's panel.
+        if (event.type === 'tool_result' && event.outputPath !== undefined && owner !== undefined) {
+          tracker.allowOutputPath(owner, event.outputPath)
+        }
+      }
+      tracker.register({
+        jobId,
+        ...(owner !== undefined ? { ownerSessionId: owner } : {}),
+        task: req.task,
+        label: req.task.replace(/\s+/g, ' ').trim().slice(0, 60),
+        ...(req.model !== undefined ? { model: req.model } : {}),
+        // Same rule as the background path: a continued run joins the tab of
+        // the conversation it resumes, from its first frame on.
+        ...(req.resume !== undefined ? { claudeSessionId: req.resume } : {}),
+        read: (fromOffset: number) => full.read(fromOffset),
+        events,
+        cancelFromUi: () => {
+          if (abort.signal.aborted) return false
+          abort.abort('cancelled')
+          return true
+        },
+      })
       try {
-        const outcome = await runClaude(req, abort)
+        sessions.begin(plan.key)
+        const outcome = await runWithSession(req, abort, sessions, plan, onDelta, onEvent)
+        tracker.settle(jobId, {
+          status: 'completed',
+          claudeSessionId: outcome.sessionId,
+          costUsd: outcome.costUsd,
+          numTurns: outcome.numTurns,
+          durationMs: outcome.durationMs,
+          finalOutput: outcome.output,
+        })
         return {
           ok: true,
           output: outcome.output,
@@ -1145,8 +1456,18 @@ export function apply(ctx: Context, config: Config) {
           durationMs: outcome.durationMs,
           numTurns: outcome.numTurns,
           ...(outcome.structuredOutput !== undefined ? { structuredOutput: outcome.structuredOutput as any } : {}),
+          ...(plan.note !== '' ? { resumeNote: plan.note } : {}),
         }
+      } catch (err) {
+        const aborted = abort.signal.aborted
+        tracker.settle(jobId, {
+          status: aborted ? 'killed' : 'failed',
+          failureDetail: aborted ? 'cancelled' : errorText(err),
+          finalOutput: full.snapshot(),
+        })
+        throw err
       } finally {
+        sessions.end(plan.key)
         exec.signal.removeEventListener('abort', onAbort)
       }
     },

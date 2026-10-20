@@ -12,8 +12,10 @@ import type {
   ConnectionService,
   JobInfo,
   ReadEventsResult,
+  ReadOutputFileResult,
   ReadOutputResult,
   RpcResult,
+  WorkstreamView,
 } from './types.js'
 
 /** One wire failure, carrying the gateway's error code when it supplied one. */
@@ -30,6 +32,11 @@ function isResult(value: unknown): value is RpcResult<unknown> {
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : ''
+}
+
+/** A count or an offset: any finite number is usable, anything else is absent. */
+function finite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : undefined
 }
 
 /**
@@ -58,13 +65,19 @@ function toEvent(raw: unknown): ClaudeEvent | null {
         name: text(event['name']) || 'tool',
         input: event['input'],
       }
-    case 'tool_result':
+    case 'tool_result': {
+      const totalChars = finite(event['totalChars'])
+      const omittedChars = finite(event['omittedChars'])
       return {
         type: 'tool_result',
         tool_use_id: typeof event['tool_use_id'] === 'string' ? event['tool_use_id'] : null,
         content: text(event['content']),
         ...(event['isError'] === true ? { isError: true } : {}),
+        ...(totalChars !== undefined ? { totalChars } : {}),
+        ...(omittedChars !== undefined ? { omittedChars } : {}),
+        ...(typeof event['outputPath'] === 'string' ? { outputPath: event['outputPath'] } : {}),
       }
+    }
     case 'tool_progress':
       return {
         type: 'tool_progress',
@@ -88,17 +101,60 @@ function toEvent(raw: unknown): ClaudeEvent | null {
         ...(typeof event['numTurns'] === 'number' ? { numTurns: event['numTurns'] } : {}),
         ...(typeof event['durationMs'] === 'number' ? { durationMs: event['durationMs'] } : {}),
         ...(event['isError'] === true ? { isError: true } : {}),
+        ...(finite(event['totalChars']) !== undefined ? { totalChars: finite(event['totalChars']) } : {}),
+        ...(finite(event['omittedChars']) !== undefined ? { omittedChars: finite(event['omittedChars']) } : {}),
       }
     default:
       return null
   }
 }
 
+/**
+ * Register rows are display-only, so a malformed one is dropped instead of
+ * failing the whole panel; a row without a session id is not a register row.
+ */
+function toWorkstream(raw: unknown): WorkstreamView | null {
+  if (raw === null || typeof raw !== 'object') return null
+  const value = raw as Record<string, unknown>
+  const str = (key: string): string => (typeof value[key] === 'string' ? (value[key] as string) : '')
+  const opt = (key: string): string | undefined => (str(key) === '' ? undefined : str(key))
+  const sessionId = str('sessionId')
+  if (sessionId === '') return null
+  const name = opt('name')
+  const description = opt('description')
+  const lastTask = opt('lastTask')
+  return {
+    key: str('key') === '' ? sessionId : str('key'),
+    sessionId,
+    cwd: str('cwd'),
+    runs: finite(value['runs']) ?? 0,
+    createdAt: str('createdAt'),
+    updatedAt: str('updatedAt'),
+    summary: str('summary'),
+    ...(name === undefined ? {} : { name }),
+    ...(description === undefined ? {} : { description }),
+    ...(lastTask === undefined ? {} : { lastTask }),
+  }
+}
+
 /** The panel's API surface, bound to one connection service. */
 export interface ClaudeCodeApi {
   listJobs(sessionId: string, signal?: AbortSignal): Promise<JobInfo[]>
+  /** The workstream register: declared name → conversation id, with descriptions. */
+  listWorkstreams(signal?: AbortSignal): Promise<WorkstreamView[]>
   readOutput(sessionId: string, jobId: string, fromOffset: number, signal?: AbortSignal): Promise<ReadOutputResult>
   readEvents(sessionId: string, jobId: string, fromOffset: number, signal?: AbortSignal): Promise<ReadEventsResult>
+  /**
+   * One window of an output file the CLI persisted for this session's run.
+   * A negative `fromOffset` counts back from the end.
+   */
+  readOutputFile(
+    sessionId: string,
+    filePath: string,
+    fromOffset: number,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<ReadOutputFileResult>
   cancel(sessionId: string, jobId: string): Promise<'requested' | 'already-finished'>
 }
 
@@ -118,6 +174,17 @@ export function createApi(connection: ConnectionService): ClaudeCodeApi {
 
   return {
     listJobs: (sessionId, signal) => call<JobInfo[]>('listJobs', { sessionId }, signal),
+    listWorkstreams: async (signal) => {
+      const raw = await call<unknown[]>('listWorkstreams', {}, signal)
+      const rows: WorkstreamView[] = []
+      if (Array.isArray(raw)) {
+        for (const item of raw) {
+          const row = toWorkstream(item)
+          if (row !== null) rows.push(row)
+        }
+      }
+      return rows
+    },
     readOutput: (sessionId, jobId, fromOffset, signal) =>
       call<ReadOutputResult>('readOutput', { sessionId, jobId, fromOffset }, signal),
     readEvents: async (sessionId, jobId, fromOffset, signal) => {
@@ -138,6 +205,22 @@ export function createApi(connection: ConnectionService): ClaudeCodeApi {
         nextOffset: typeof raw.nextOffset === 'number' ? raw.nextOffset : fromOffset,
         truncated: raw.truncated === true,
         status: (raw.status as ReadEventsResult['status']) ?? 'running',
+      }
+    },
+    readOutputFile: async (sessionId, filePath, fromOffset, limit, signal) => {
+      const raw = await call<{
+        text?: unknown
+        offset?: unknown
+        prevOffset?: unknown
+        totalBytes?: unknown
+        hasMoreBefore?: unknown
+      }>('readOutputFile', { sessionId, filePath, fromOffset, limit }, signal)
+      return {
+        text: text(raw.text),
+        offset: finite(raw.offset) ?? 0,
+        prevOffset: finite(raw.prevOffset) ?? 0,
+        totalBytes: finite(raw.totalBytes) ?? 0,
+        hasMoreBefore: raw.hasMoreBefore === true,
       }
     },
     cancel: (sessionId, jobId) => call<'requested' | 'already-finished'>('cancel', { sessionId, jobId }),

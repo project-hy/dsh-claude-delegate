@@ -23,6 +23,7 @@ export const CSS = {
   tabDotFailed: 'ccp-tabDotFailed',
   tabDotKilled: 'ccp-tabDotKilled',
   tabLabel: 'ccp-tabLabel',
+  tabCount: 'ccp-tabCount',
   tabInfo: 'ccp-tabInfo',
   modalOverlay: 'ccp-modalOverlay',
   modal: 'ccp-modal',
@@ -37,9 +38,19 @@ export const CSS = {
   modalFailure: 'ccp-modalFailure',
   modalFoot: 'ccp-modalFoot',
   pane: 'ccp-pane',
+  paneMulti: 'ccp-paneMulti',
   paneHead: 'ccp-paneHead',
   stats: 'ccp-stats',
   stat: 'ccp-stat',
+  groupHead: 'ccp-groupHead',
+  registerBar: 'ccp-registerBar',
+  registerToggle: 'ccp-registerToggle',
+  registerList: 'ccp-registerList',
+  registerRow: 'ccp-registerRow',
+  registerEmpty: 'ccp-registerEmpty',
+  userRow: 'ccp-userRow',
+  userStack: 'ccp-userStack',
+  bubble: 'ccp-bubble',
   output: 'ccp-output',
   outputBody: 'ccp-outputBody',
   outputLine: 'ccp-outputLine',
@@ -85,6 +96,12 @@ export const CSS = {
   evConsoleBody: 'ccp-evConsoleBody',
   evConsoleErr: 'ccp-evConsoleErr',
   evConsoleMeta: 'ccp-evConsoleMeta',
+  evTerminalCmd: 'ccp-evTerminalCmd',
+  evTerminalBody: 'ccp-evTerminalBody',
+  evPersisted: 'ccp-evPersisted',
+  evPersistedHead: 'ccp-evPersistedHead',
+  evPersistedBody: 'ccp-evPersistedBody',
+  evResultActions: 'ccp-evResultActions',
   evResult: 'ccp-evResult',
   evWarning: 'ccp-evWarning',
   evMore: 'ccp-evMore',
@@ -189,6 +206,17 @@ const CSS_TEXT = `
   text-overflow: ellipsis;
 }
 .ccp-tabActive .ccp-tabMain { font-weight: 600; }
+/* Run counter on a tab that holds a whole conversation, not a single call. */
+.ccp-tabCount {
+  flex: none;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--dsw-alias-fill-l2);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+  line-height: 14px;
+  font-variant-numeric: tabular-nums;
+}
 .ccp-tabDot {
   flex: none;
   width: 7px;
@@ -304,12 +332,118 @@ const CSS_TEXT = `
 .ccp-pane {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
   flex: 1;
   min-width: 0;
   min-height: 0;
 }
+/* A conversation of several runs flows in one scroller — the pane itself — and
+   each run keeps its natural height. Without this every run's own scroll box
+   shares one fixed pane height and the earlier replies are squeezed to a sliver. */
+.ccp-paneMulti { overflow-y: auto; }
+.ccp-paneMulti > * { flex: none; }
+.ccp-paneMulti .ccp-events,
+.ccp-paneMulti .ccp-output {
+  flex: none;
+  overflow: visible;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.ccp-paneMulti .ccp-eventsBody,
+.ccp-paneMulti .ccp-outputBody {
+  height: auto;
+  overflow: visible;
+  padding: 0;
+}
+/* The per-run "back to bottom" pill belongs to a scroll box, not to the pane. */
+.ccp-paneMulti .ccp-follow { display: none; }
 .ccp-paneHead { display: flex; flex-direction: column; gap: 4px; flex: none; }
+/* Separates the runs of one conversation inside the pane. */
+.ccp-registerBar {
+  display: flex;
+  align-items: center;
+  padding: 2px 10px 4px;
+  flex: none;
+}
+
+.ccp-registerToggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ccp-registerToggle:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.ccp-registerList {
+  margin: 0 10px 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-fill-l2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: none;
+}
+
+.ccp-registerRow {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ccp-registerEmpty {
+  margin: 0 10px 6px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.ccp-groupHead {
+  flex: none;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-fill-l2);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+/* --- the task each run was given, drawn the way the main chat draws a user turn --- */
+.ccp-userRow {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex: none;
+}
+.ccp-userStack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: 0;
+  max-width: min(calc(var(--dsh-chat-content-width, 748px) * 0.702), 82%);
+}
+.ccp-bubble {
+  max-width: 100%;
+  padding: 10px 16px;
+  border-radius: 22px;
+  background: var(--dsw-specific-bubble, var(--dsw-alias-fill-l2));
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(22px + var(--dsh-content-font-delta, 0px));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .ccp-stats {
   display: flex;
   flex-wrap: wrap;
@@ -370,8 +504,9 @@ const CSS_TEXT = `
    (the block elements md.ts emits own their own spacing) rather than pre-wrap. */
 .ccp-evText {
   word-break: break-word;
-  font-size: 13px;
-  line-height: 20px;
+  /* Same size and rhythm as the main chat's assistant prose. */
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
   color: var(--dsw-alias-label-primary);
 }
 .ccp-evTextRaw {
@@ -390,6 +525,10 @@ const CSS_TEXT = `
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  /* The main chat's own prose metrics, so replies read the same here. */
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  color: var(--dsw-alias-label-primary);
 }
 /* Fallback when the parser refused the source: show it verbatim. */
 .ccp-mdRaw {
@@ -484,14 +623,12 @@ const CSS_TEXT = `
   font-size: 12px;
   line-height: 18px;
 }
+/* A tool call reads as one line of the conversation, not as a card. */
 .ccp-evTool {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 6px 8px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 6px;
-  background: var(--dsw-alias-fill-l2);
+  gap: 2px;
+  min-width: 0;
 }
 .ccp-evToolHead {
   display: flex;
@@ -509,10 +646,9 @@ const CSS_TEXT = `
 }
 .ccp-evToolBadge {
   flex: none;
-  font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
-  font-size: 12px;
-  line-height: 18px;
-  font-weight: 600;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  font-weight: 500;
 }
 .ccp-evTone0 { color: var(--dsw-alias-state-business-primary); }
 .ccp-evTone1 { color: var(--dsw-alias-state-success, #3d9970); }
@@ -544,7 +680,8 @@ const CSS_TEXT = `
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-left: 10px;
+  /* The main chat indents a tool's detail by 22px under its summary line. */
+  margin-left: 22px;
   padding-left: 8px;
   border-left: 2px solid var(--dsw-alias-border-l2);
 }
@@ -603,6 +740,57 @@ const CSS_TEXT = `
   word-break: break-word;
 }
 .ccp-evConsoleErr { color: var(--dsw-alias-state-error, #d05353); }
+
+/* --- built-in Bash / PowerShell: command line + output read as a terminal --- */
+.ccp-evTerminalCmd {
+  font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Modifier on .ccp-evToolResultBody: a bordered, scrollable terminal pane. */
+.ccp-evTerminalBody {
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-fill-l1);
+}
+/* --- the CLI's own persisted output file, read back on demand --- */
+.ccp-evPersisted {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-fill-l1);
+}
+.ccp-evPersistedHead {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.ccp-evPersistedBody {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+.ccp-evResultActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
 .ccp-evWarning {
   padding: 6px 10px;
   border: 1px solid var(--dsw-alias-state-warning, #c98a1f);
